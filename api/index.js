@@ -52,7 +52,7 @@ async function getConfig(db) {
   return cfg;
 }
 
-// --- Bridge Processor: Forward -> Extract -> Instant Delete -> Clean Post (With Quote) ---
+// --- Bridge Processor: Forward -> Extract -> Delete Temp -> Dynamic Quote Post ---
 async function copyWithExtractedButtons(msgId) {
   // 1. Silent forward to Admin chat
   const forwarded = await bot.telegram.forwardMessage(
@@ -65,25 +65,35 @@ async function copyWithExtractedButtons(msgId) {
   let targetMsg = null;
 
   try {
-    // 2. Extract original inline keyboard markup
     const originalMarkup = forwarded.reply_markup || undefined;
 
-    // 3. Re-brand caption / text & wrap inside Telegram Blockquote
+    // Check if the original message had blockquote formatting
+    const entities = forwarded.caption_entities || forwarded.entities || [];
+    const hasQuote = entities.some(
+      (e) => e.type === 'blockquote' || e.type === 'expandable_blockquote'
+    );
+
     let rawCaption = forwarded.caption || forwarded.text || '';
-    let caption = '';
+    let finalCaption = '';
 
     if (rawCaption) {
       rawCaption = rawCaption.replace(/Hot Lanka/gi, 'VibeLK');
-      caption = `<blockquote>${rawCaption}</blockquote>`;
+      
+      // මුල් post එකේ Quote එකක් තිබුණා නම් පමණක් blockquote එක යොදයි
+      if (hasQuote) {
+        finalCaption = `<blockquote>${rawCaption}</blockquote>`;
+      } else {
+        finalCaption = rawCaption;
+      }
     }
 
     const postOptions = {
-      caption: caption,
+      caption: finalCaption,
       parse_mode: 'HTML',
       reply_markup: originalMarkup
     };
 
-    // 4. Clean post directly to VibeLK (No Forward Tag)
+    // Clean post directly to VibeLK (No Forward Tag)
     if (forwarded.photo && forwarded.photo.length > 0) {
       const highestPhoto = forwarded.photo[forwarded.photo.length - 1].file_id;
       targetMsg = await bot.telegram.sendPhoto(TARGET_CHANNEL_ID, highestPhoto, postOptions);
@@ -94,19 +104,19 @@ async function copyWithExtractedButtons(msgId) {
     } else if (forwarded.animation) {
       targetMsg = await bot.telegram.sendAnimation(TARGET_CHANNEL_ID, forwarded.animation.file_id, postOptions);
     } else if (forwarded.text) {
-      targetMsg = await bot.telegram.sendMessage(TARGET_CHANNEL_ID, caption, {
+      targetMsg = await bot.telegram.sendMessage(TARGET_CHANNEL_ID, finalCaption, {
         parse_mode: 'HTML',
         reply_markup: originalMarkup
       });
     } else {
       targetMsg = await bot.telegram.copyMessage(TARGET_CHANNEL_ID, SOURCE_CHANNEL_ID, msgId, {
-        caption: caption,
+        caption: finalCaption,
         parse_mode: 'HTML',
         reply_markup: originalMarkup
       });
     }
   } finally {
-    // 5. Always delete the temporary message from Admin chat immediately
+    // Delete temporary message from Admin chat immediately
     await bot.telegram.deleteMessage(ADMIN_ID, forwarded.message_id).catch(() => {});
   }
 
@@ -267,7 +277,7 @@ bot.action('admin_toggle_status', async (ctx) => {
 
 bot.action('admin_post_now', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
-  await ctx.answerCbQuery('🚀 Processing batch with buttons...');
+  await ctx.answerCbQuery('🚀 Processing batch...');
   const db = await getDb();
   
   const result = await runPostingBatch(db, true);
@@ -279,7 +289,7 @@ bot.action('admin_post_now', async (ctx) => {
   }).catch(() => {});
 
   if (result.posted > 0) {
-    await ctx.reply(`✅ <b>Success!</b> ${result.posted} posts published to VibeLK with buttons & quotes! 🔥\n📌 Next Message ID: #${result.nextId}`, { parse_mode: 'HTML' });
+    await ctx.reply(`✅ <b>Success!</b> ${result.posted} posts published to VibeLK! 🔥\n📌 Next Message ID: #${result.nextId}`, { parse_mode: 'HTML' });
   } else {
     await ctx.reply(`⚠️ No new posts were found starting from ID #${cfg.last_message_id}.`);
   }
@@ -433,6 +443,7 @@ module.exports = async (req, res) => {
   try {
     const db = await getDb();
 
+    // Cron Ping Handler
     if (req.method === 'GET') {
       const now = new Date();
       const slDate = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
