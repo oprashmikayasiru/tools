@@ -1,24 +1,22 @@
 const { Telegraf, Markup } = require('telegraf');
 const { MongoClient } = require('mongodb');
 
-// --- Direct Configurations ---
+// --- Configuration ---
 const BOT_TOKEN = process.env.BOT_TOKEN || '9251791914:AAHG26G5mVVShsQpF8PK1fvpWgmZ__FNPCk';
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://oprashmikayasiru_db_user:AMcK5sVpxXr3R7VT@cluster0.ulukf3s.mongodb.net/vibelk_tools_db?retryWrites=true&w=majority';
 const ADMIN_ID = Number(process.env.ADMIN_ID) || 5411921025;
 
-// Channels Mapping
-const SOURCE_CHANNEL_ID = Number(process.env.MAIN_CHANNEL_ID) || -1004309315754; // Hot Lanka V2
-const TARGET_CHANNEL_ID = Number(process.env.TARGET_CHANNEL_ID) || -1004472514921; // VibeLK 🔥
+// Correct Telegram Private Channel IDs (With -100 prefix)
+const SOURCE_CHANNEL_ID = -1004309315754; // Hot Lanka V2
+const TARGET_CHANNEL_ID = -1004472514921; // VibeLK 🔥
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// --- MongoDB Global Caching ---
 let cachedDb = null;
 let clientPromise = null;
 
 async function getDb() {
   if (cachedDb) return cachedDb;
-
   if (!clientPromise) {
     const client = new MongoClient(MONGODB_URI, {
       maxPoolSize: 10,
@@ -27,7 +25,6 @@ async function getDb() {
     });
     clientPromise = client.connect();
   }
-
   const client = await clientPromise;
   cachedDb = client.db('vibelk_tools_db');
   return cachedDb;
@@ -35,7 +32,6 @@ async function getDb() {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// --- System State Helper ---
 async function getConfig(db) {
   let cfg = await db.collection('settings').findOne({ _id: 'main_config' });
   if (!cfg) {
@@ -44,7 +40,7 @@ async function getConfig(db) {
       is_active: true,
       batch_size: 10,
       schedule_times: ['05:00', '20:00'],
-      last_message_id: 7, // ඔබගේ පළමු Post ID එක 7 ලෙස සකස් කළා
+      last_message_id: 7,
       is_posting_locked: false,
       last_posted_hour: null,
       approved_channels: [
@@ -57,12 +53,12 @@ async function getConfig(db) {
   return cfg;
 }
 
-// --- Ultra-Fast Posting Worker ---
+// --- Posting Worker ---
 async function runPostingBatch(db, manualTrigger = false) {
   const cfg = await getConfig(db);
   if (!cfg.is_active && !manualTrigger) return;
 
-  // Duplicate Protector: Concurrency Lock
+  // Concurrency Lock Check
   const lockAcquired = await db.collection('settings').updateOne(
     { _id: 'main_config', is_posting_locked: { $ne: true } },
     { $set: { is_posting_locked: true } }
@@ -70,7 +66,7 @@ async function runPostingBatch(db, manualTrigger = false) {
 
   if (lockAcquired.matchedCount === 0) {
     if (ADMIN_ID && manualTrigger) {
-      await bot.telegram.sendMessage(ADMIN_ID, '⚠️ Posting loop is already running!').catch(() => {});
+      await bot.telegram.sendMessage(ADMIN_ID, '⚠️ Posting loop is already running! If stuck, use /unlock to reset.').catch(() => {});
     }
     return;
   }
@@ -80,10 +76,10 @@ async function runPostingBatch(db, manualTrigger = false) {
   const targetCount = cfg.batch_size || 10;
   let consecutiveErrors = 0;
   const maxScanLimit = currentMsgId + 100;
+  let lastErrorDetail = '';
 
   try {
     while (postedCount < targetCount && currentMsgId < maxScanLimit) {
-      // Duplicate Protector: Skip already processed IDs
       const isAlreadyProcessed = await db.collection('processed_posts').findOne({ _id: currentMsgId });
       if (isAlreadyProcessed) {
         currentMsgId++;
@@ -91,14 +87,14 @@ async function runPostingBatch(db, manualTrigger = false) {
       }
 
       try {
-        // Step 1: Copy post with media and buttons
+        // Step 1: Copy message
         const copied = await bot.telegram.copyMessage(
           TARGET_CHANNEL_ID,
           SOURCE_CHANNEL_ID,
           currentMsgId
         );
 
-        // Step 2: Re-brand caption (Hot Lanka -> VibeLK)
+        // Step 2: Re-brand Caption
         if (copied && copied.caption) {
           const originalCaption = copied.caption;
           const rebrandedCaption = originalCaption.replace(/Hot Lanka/gi, 'VibeLK');
@@ -121,7 +117,7 @@ async function runPostingBatch(db, manualTrigger = false) {
           }
         }
 
-        // Duplicate Protector: Save record
+        // Duplicate Protection Record
         await db.collection('processed_posts').insertOne({
           _id: currentMsgId,
           target_msg_id: copied.message_id,
@@ -131,18 +127,16 @@ async function runPostingBatch(db, manualTrigger = false) {
         postedCount++;
         consecutiveErrors = 0;
 
-        // Instant pointer save
         await db.collection('settings').updateOne(
           { _id: 'main_config' },
           { $set: { last_message_id: currentMsgId + 1 } }
         );
 
-        // Optimized delay to prevent Vercel 10s Serverless timeout
-        await sleep(700);
+        await sleep(500);
       } catch (err) {
+        lastErrorDetail = err.message || '';
         consecutiveErrors++;
-        // IDs 15ක් එක දිගට හිස් නම් පමණක් loop එක නවතී
-        if (consecutiveErrors > 15) break;
+        if (consecutiveErrors > 25) break;
       }
       currentMsgId++;
     }
@@ -157,13 +151,11 @@ async function runPostingBatch(db, manualTrigger = false) {
       } else {
         await bot.telegram.sendMessage(
           ADMIN_ID,
-          `⚠️ No new posts found around ID #${cfg.last_message_id}. Check if Bot is an Admin in the source channel.`,
+          `⚠️ No posts copied. (Scanned up to #${currentMsgId})\nReason: <code>${lastErrorDetail || 'Messages not found or permissions missing'}</code>`,
           { parse_mode: 'HTML' }
         ).catch(() => {});
       }
     }
-  } catch (globalErr) {
-    console.error('Batch error:', globalErr);
   } finally {
     // Release Lock
     await db.collection('settings').updateOne(
@@ -173,7 +165,7 @@ async function runPostingBatch(db, manualTrigger = false) {
   }
 }
 
-// --- Universal Auto-Approval Listener ---
+// --- Universal Auto-Approval ---
 bot.on('chat_join_request', async (ctx) => {
   try {
     const db = await getDb();
@@ -195,7 +187,7 @@ bot.on('chat_join_request', async (ctx) => {
   }
 });
 
-// --- Admin Panel UI Helpers ---
+// --- UI Helpers ---
 function getAdminKeyboard(cfg) {
   const statusIcon = cfg.is_active ? '🟢 ACTIVE' : '🔴 PAUSED';
   return Markup.inlineKeyboard([
@@ -223,7 +215,7 @@ function renderAdminText(cfg) {
     `📌 <b>Current Msg ID:</b> #${cfg.last_message_id || 7}`;
 }
 
-// --- Commands & Handlers ---
+// --- Commands ---
 bot.command('admin', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   const db = await getDb();
@@ -231,20 +223,29 @@ bot.command('admin', async (ctx) => {
   await ctx.replyWithHTML(renderAdminText(cfg), getAdminKeyboard(cfg));
 });
 
-// Manual ID Set Command: /setid 7
+// Unlock Command (කවදාහරි හිරවුණොත් එක පාරින් reset කරගන්න)
+bot.command('unlock', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  const db = await getDb();
+  await db.collection('settings').updateOne(
+    { _id: 'main_config' },
+    { $set: { is_posting_locked: false } }
+  );
+  await ctx.reply('🔓 Posting loop lock cleared! You can now use Post Now.');
+});
+
+// Manual Set ID: /setid 7
 bot.command('setid', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   const parts = ctx.message.text.split(' ');
   const newId = parseInt(parts[1], 10);
-  if (isNaN(newId)) {
-    return ctx.reply('Usage: /setid 7');
-  }
+  if (isNaN(newId)) return ctx.reply('Usage: /setid 7');
   const db = await getDb();
   await db.collection('settings').updateOne(
     { _id: 'main_config' },
-    { $set: { last_message_id: newId } }
+    { $set: { last_message_id: newId, is_posting_locked: false } }
   );
-  await ctx.reply(`✅ Next Message ID set to #${newId}`);
+  await ctx.reply(`✅ Next Message ID set to #${newId} and lock cleared.`);
 });
 
 bot.action('admin_refresh', async (ctx) => {
