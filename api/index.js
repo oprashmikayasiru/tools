@@ -1,18 +1,17 @@
 const { Telegraf, Markup } = require('telegraf');
 const { MongoClient } = require('mongodb');
 
-// --- Configurations & Credentials ---
+// --- Configuration & IDs ---
 const BOT_TOKEN = process.env.BOT_TOKEN || '9251791914:AAHG26G5mVVShsQpF8PK1fvpWgmZ__FNPCk';
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://oprashmikayasiru_db_user:AMcK5sVpxXr3R7VT@cluster0.ulukf3s.mongodb.net/vibelk_tools_db?retryWrites=true&w=majority';
 const ADMIN_ID = Number(process.env.ADMIN_ID) || 5411921025;
 
-// Channel Mappings
 const SOURCE_CHANNEL_ID = -1004309315754; // Hot Lanka V2
 const TARGET_CHANNEL_ID = -1004472514921; // VibeLK 🔥
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// --- Mongo Connection Caching ---
+// --- Mongo Global Cache ---
 let cachedDb = null;
 let clientPromise = null;
 
@@ -53,9 +52,9 @@ async function getConfig(db) {
   return cfg;
 }
 
-// --- No-Forward-Tag Button Preserver Function ---
+// --- Bridge Processor: Forward -> Extract -> Instant Delete -> Clean Post ---
 async function copyWithExtractedButtons(msgId) {
-  // Step 1: Forward quietly to Admin to read the internal Telegram markup payload
+  // 1. Silent forward to Admin chat
   const forwarded = await bot.telegram.forwardMessage(
     ADMIN_ID,
     SOURCE_CHANNEL_ID,
@@ -63,51 +62,54 @@ async function copyWithExtractedButtons(msgId) {
     { disable_notification: true }
   );
 
-  // Extract Buttons & Caption
-  const originalMarkup = forwarded.reply_markup || undefined;
-  let caption = forwarded.caption || forwarded.text || '';
-  if (caption) {
-    caption = caption.replace(/Hot Lanka/gi, 'VibeLK');
-  }
-
-  const extraOptions = {
-    caption: caption,
-    parse_mode: 'HTML',
-    reply_markup: originalMarkup
-  };
-
   let targetMsg = null;
 
-  // Step 2: Direct Post to Target without any forward tag based on media type
-  if (forwarded.photo && forwarded.photo.length > 0) {
-    const highestPhoto = forwarded.photo[forwarded.photo.length - 1].file_id;
-    targetMsg = await bot.telegram.sendPhoto(TARGET_CHANNEL_ID, highestPhoto, extraOptions);
-  } else if (forwarded.video) {
-    targetMsg = await bot.telegram.sendVideo(TARGET_CHANNEL_ID, forwarded.video.file_id, extraOptions);
-  } else if (forwarded.document) {
-    targetMsg = await bot.telegram.sendDocument(TARGET_CHANNEL_ID, forwarded.document.file_id, extraOptions);
-  } else if (forwarded.animation) {
-    targetMsg = await bot.telegram.sendAnimation(TARGET_CHANNEL_ID, forwarded.animation.file_id, extraOptions);
-  } else if (forwarded.text) {
-    targetMsg = await bot.telegram.sendMessage(TARGET_CHANNEL_ID, caption, {
+  try {
+    // 2. Extract original inline keyboard markup
+    const originalMarkup = forwarded.reply_markup || undefined;
+
+    // 3. Re-brand caption / text
+    let caption = forwarded.caption || forwarded.text || '';
+    if (caption) {
+      caption = caption.replace(/Hot Lanka/gi, 'VibeLK');
+    }
+
+    const postOptions = {
+      caption: caption,
       parse_mode: 'HTML',
       reply_markup: originalMarkup
-    });
-  } else {
-    // Fallback direct copy
-    targetMsg = await bot.telegram.copyMessage(TARGET_CHANNEL_ID, SOURCE_CHANNEL_ID, msgId, {
-      caption: caption,
-      reply_markup: originalMarkup
-    });
-  }
+    };
 
-  // Step 3: Delete temporary inspection forward from Admin chat
-  await bot.telegram.deleteMessage(ADMIN_ID, forwarded.message_id).catch(() => {});
+    // 4. Clean post directly to VibeLK (No Forward Tag)
+    if (forwarded.photo && forwarded.photo.length > 0) {
+      const highestPhoto = forwarded.photo[forwarded.photo.length - 1].file_id;
+      targetMsg = await bot.telegram.sendPhoto(TARGET_CHANNEL_ID, highestPhoto, postOptions);
+    } else if (forwarded.video) {
+      targetMsg = await bot.telegram.sendVideo(TARGET_CHANNEL_ID, forwarded.video.file_id, postOptions);
+    } else if (forwarded.document) {
+      targetMsg = await bot.telegram.sendDocument(TARGET_CHANNEL_ID, forwarded.document.file_id, postOptions);
+    } else if (forwarded.animation) {
+      targetMsg = await bot.telegram.sendAnimation(TARGET_CHANNEL_ID, forwarded.animation.file_id, postOptions);
+    } else if (forwarded.text) {
+      targetMsg = await bot.telegram.sendMessage(TARGET_CHANNEL_ID, caption, {
+        parse_mode: 'HTML',
+        reply_markup: originalMarkup
+      });
+    } else {
+      targetMsg = await bot.telegram.copyMessage(TARGET_CHANNEL_ID, SOURCE_CHANNEL_ID, msgId, {
+        caption: caption,
+        reply_markup: originalMarkup
+      });
+    }
+  } finally {
+    // 5. Always delete the temporary message from Admin chat immediately
+    await bot.telegram.deleteMessage(ADMIN_ID, forwarded.message_id).catch(() => {});
+  }
 
   return targetMsg;
 }
 
-// --- Batch Worker Execution ---
+// --- Posting Batch Loop ---
 async function runPostingBatch(db, manualTrigger = false) {
   const cfg = await getConfig(db);
   if (!cfg.is_active && !manualTrigger) return { posted: 0 };
@@ -141,7 +143,7 @@ async function runPostingBatch(db, manualTrigger = false) {
         { $set: { last_message_id: currentMsgId + 1 } }
       );
 
-      await sleep(500);
+      await sleep(600);
     } catch (err) {
       consecutiveErrors++;
       if (consecutiveErrors > 25) break;
@@ -152,7 +154,7 @@ async function runPostingBatch(db, manualTrigger = false) {
   return { posted: postedCount, nextId: currentMsgId };
 }
 
-// --- Universal Auto-Approval Listener ---
+// --- Auto-Approval Handler ---
 bot.on('chat_join_request', async (ctx) => {
   try {
     const db = await getDb();
@@ -172,7 +174,7 @@ bot.on('chat_join_request', async (ctx) => {
   } catch (e) {}
 });
 
-// --- Admin Dashboard UI Helpers ---
+// --- Admin Keyboard Helpers ---
 function getAdminKeyboard(cfg) {
   const statusIcon = cfg.is_active ? '🟢 ACTIVE' : '🔴 PAUSED';
   return Markup.inlineKeyboard([
@@ -200,6 +202,7 @@ function renderAdminText(cfg) {
     `📌 <b>Current Msg ID:</b> #${cfg.last_message_id || 8}`;
 }
 
+// --- Commands & Actions ---
 bot.command('admin', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   const db = await getDb();
@@ -249,7 +252,7 @@ bot.action('admin_toggle_status', async (ctx) => {
 
 bot.action('admin_post_now', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
-  await ctx.answerCbQuery('🚀 Starting batch with buttons...');
+  await ctx.answerCbQuery('🚀 Processing batch with buttons...');
   const db = await getDb();
   
   const result = await runPostingBatch(db, true);
@@ -356,7 +359,7 @@ bot.action(/set_batch_(\d+)/, async (ctx) => {
   }).catch(() => {});
 });
 
-// UI: Channel Auto-Approval
+// UI: Auto-Approve Channel Management
 bot.action('admin_ui_channels', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const db = await getDb();
@@ -413,6 +416,7 @@ module.exports = async (req, res) => {
   try {
     const db = await getDb();
 
+    // Cron Trigger (Every 5 minutes)
     if (req.method === 'GET') {
       const now = new Date();
       const slDate = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
@@ -434,6 +438,7 @@ module.exports = async (req, res) => {
       return res.status(200).json({ ok: true, keepalive: true });
     }
 
+    // Telegram Updates Handler
     if (req.method === 'POST' && req.body) {
       await bot.handleUpdate(req.body);
       return res.status(200).json({ ok: true });
