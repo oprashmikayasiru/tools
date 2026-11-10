@@ -38,7 +38,7 @@ async function getConfig(db) {
       is_active: true,
       batch_size: 5,
       schedule_times: ['05:00', '20:00'],
-      last_message_id: 7,
+      last_message_id: 8,
       is_posting_locked: false,
       last_posted_hour: null,
       approved_channels: [
@@ -51,7 +51,7 @@ async function getConfig(db) {
   return cfg;
 }
 
-// Single Post Direct Copy Function
+// Single Copy Helper
 async function copySingleMessage(msgId) {
   const copied = await bot.telegram.copyMessage(
     TARGET_CHANNEL_ID,
@@ -82,76 +82,53 @@ async function copySingleMessage(msgId) {
   return copied;
 }
 
-// Posting Worker
+// Synchronous Batch Worker (Waits until completed)
 async function runPostingBatch(db, manualTrigger = false) {
   const cfg = await getConfig(db);
-  if (!cfg.is_active && !manualTrigger) return;
+  if (!cfg.is_active && !manualTrigger) return { posted: 0, reason: 'inactive' };
 
-  const lockAcquired = await db.collection('settings').updateOne(
-    { _id: 'main_config', is_posting_locked: { $ne: true } },
-    { $set: { is_posting_locked: true } }
-  );
-
-  if (lockAcquired.matchedCount === 0) {
-    if (ADMIN_ID && manualTrigger) {
-      await bot.telegram.sendMessage(ADMIN_ID, '⚠️ Loop already running! Use /unlock to reset.').catch(() => {});
-    }
-    return;
-  }
-
-  let currentMsgId = cfg.last_message_id || 7;
+  let currentMsgId = cfg.last_message_id || 8;
   let postedCount = 0;
   const targetCount = cfg.batch_size || 5;
-  let errorLog = '';
+  let consecutiveErrors = 0;
+  const maxScanLimit = currentMsgId + 100;
 
-  try {
-    while (postedCount < targetCount && currentMsgId < (cfg.last_message_id + 50)) {
-      try {
-        await copySingleMessage(currentMsgId);
-
-        await db.collection('processed_posts').insertOne({
-          _id: currentMsgId,
-          posted_at: new Date()
-        }).catch(() => {});
-
-        postedCount++;
-
-        await db.collection('settings').updateOne(
-          { _id: 'main_config' },
-          { $set: { last_message_id: currentMsgId + 1 } }
-        );
-
-        await sleep(500);
-      } catch (err) {
-        errorLog = err.message;
-      }
+  while (postedCount < targetCount && currentMsgId < maxScanLimit) {
+    const isAlreadyProcessed = await db.collection('processed_posts').findOne({ _id: currentMsgId });
+    if (isAlreadyProcessed) {
       currentMsgId++;
+      continue;
     }
 
-    if (ADMIN_ID) {
-      if (postedCount > 0) {
-        await bot.telegram.sendMessage(
-          ADMIN_ID,
-          `✅ <b>Batch Completed:</b> ${postedCount} posts published to VibeLK!\n📌 Next ID: #${currentMsgId}`,
-          { parse_mode: 'HTML' }
-        ).catch(() => {});
-      } else {
-        await bot.telegram.sendMessage(
-          ADMIN_ID,
-          `⚠️ 0 posts copied.\nLast error: <code>${errorLog || 'None'}</code>\nScanned ID: #${currentMsgId}`,
-          { parse_mode: 'HTML' }
-        ).catch(() => {});
-      }
+    try {
+      await copySingleMessage(currentMsgId);
+
+      await db.collection('processed_posts').insertOne({
+        _id: currentMsgId,
+        posted_at: new Date()
+      }).catch(() => {});
+
+      postedCount++;
+      consecutiveErrors = 0;
+
+      await db.collection('settings').updateOne(
+        { _id: 'main_config' },
+        { $set: { last_message_id: currentMsgId + 1 } }
+      );
+
+      // Fast non-blocking delay
+      await sleep(400);
+    } catch (err) {
+      consecutiveErrors++;
+      if (consecutiveErrors > 25) break;
     }
-  } finally {
-    await db.collection('settings').updateOne(
-      { _id: 'main_config' },
-      { $set: { is_posting_locked: false } }
-    );
+    currentMsgId++;
   }
+
+  return { posted: postedCount, nextId: currentMsgId };
 }
 
-// --- Join Request ---
+// Auto Approval
 bot.on('chat_join_request', async (ctx) => {
   try {
     const db = await getDb();
@@ -171,19 +148,7 @@ bot.on('chat_join_request', async (ctx) => {
   } catch (e) {}
 });
 
-// --- Direct Test Command: /testpost ---
-bot.command('testpost', async (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
-  await ctx.reply('⏳ Trying to copy Message ID 7 right now...');
-  try {
-    const res = await copySingleMessage(7);
-    await ctx.reply(`🎉 SUCCESS! Message copied to VibeLK (New ID: ${res.message_id})`);
-  } catch (err) {
-    await ctx.reply(`❌ FAILED!\nError: ${err.message}\n\nCheck:\n1. Is Bot an Admin in both channels?\n2. Does Bot have 'Post Messages' rights in VibeLK?`);
-  }
-});
-
-// Admin Panel Helpers
+// Admin UI Helpers
 function getAdminKeyboard(cfg) {
   const statusIcon = cfg.is_active ? '🟢 ACTIVE' : '🔴 PAUSED';
   return Markup.inlineKeyboard([
@@ -208,7 +173,7 @@ function renderAdminText(cfg) {
     `📦 <b>Batch:</b> ${cfg.batch_size} Posts\n` +
     `⏰ <b>Schedule:</b> ${timesStr}\n` +
     `📢 <b>Auto-Approve:</b> ${channelsCount} Channels\n` +
-    `📌 <b>Current Msg ID:</b> #${cfg.last_message_id || 7}`;
+    `📌 <b>Current Msg ID:</b> #${cfg.last_message_id || 8}`;
 }
 
 bot.command('admin', async (ctx) => {
@@ -218,25 +183,15 @@ bot.command('admin', async (ctx) => {
   await ctx.replyWithHTML(renderAdminText(cfg), getAdminKeyboard(cfg));
 });
 
-bot.command('unlock', async (ctx) => {
-  if (ctx.from.id !== ADMIN_ID) return;
-  const db = await getDb();
-  await db.collection('settings').updateOne(
-    { _id: 'main_config' },
-    { $set: { is_posting_locked: false } }
-  );
-  await ctx.reply('🔓 Lock cleared.');
-});
-
 bot.command('setid', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   const parts = ctx.message.text.split(' ');
   const newId = parseInt(parts[1], 10);
-  if (isNaN(newId)) return ctx.reply('Usage: /setid 7');
+  if (isNaN(newId)) return ctx.reply('Usage: /setid 8');
   const db = await getDb();
   await db.collection('settings').updateOne(
     { _id: 'main_config' },
-    { $set: { last_message_id: newId, is_posting_locked: false } }
+    { $set: { last_message_id: newId } }
   );
   await ctx.reply(`✅ Next Message ID set to #${newId}`);
 });
@@ -268,20 +223,174 @@ bot.action('admin_toggle_status', async (ctx) => {
   await ctx.answerCbQuery();
 });
 
+// Awaited Post Now Action
 bot.action('admin_post_now', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
-  await ctx.answerCbQuery('🚀 Starting batch...');
+  await ctx.answerCbQuery('🚀 Posting batch in progress...');
   const db = await getDb();
-  runPostingBatch(db, true);
+  
+  const result = await runPostingBatch(db, true);
+  const cfg = await getConfig(db);
+
+  await ctx.editMessageText(renderAdminText(cfg), {
+    parse_mode: 'HTML',
+    ...getAdminKeyboard(cfg)
+  }).catch(() => {});
+
+  if (result.posted > 0) {
+    await ctx.reply(`✅ <b>Success!</b> ${result.posted} posts published to VibeLK! 🔥\n📌 Next Message ID: #${result.nextId}`, { parse_mode: 'HTML' });
+  } else {
+    await ctx.reply(`⚠️ No new posts were found starting from ID #${cfg.last_message_id}. Check if message IDs exist.`);
+  }
 });
 
-// Gateway
+// Times UI
+bot.action('admin_ui_times', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
+  const db = await getDb();
+  const cfg = await getConfig(db);
+  const activeTimes = cfg.schedule_times || [];
+
+  const is5 = activeTimes.includes('05:00');
+  const is15 = activeTimes.includes('15:00');
+  const is20 = activeTimes.includes('20:00');
+
+  const kb = Markup.inlineKeyboard([
+    [Markup.button.callback(`🌅 Morning (05:00 AM) ${is5 ? '✅' : '▫️'}`, 'toggle_time_05:00')],
+    [Markup.button.callback(`🌇 Evening (03:00 PM) ${is15 ? '✅' : '▫️'}`, 'toggle_time_15:00')],
+    [Markup.button.callback(`🌙 Night (08:00 PM)   ${is20 ? '✅' : '▫️'}`, 'toggle_time_20:00')],
+    [Markup.button.callback('🔙 Back', 'admin_refresh')]
+  ]);
+
+  await ctx.editMessageText('⏰ <b>SELECT POSTING TIMES</b>\nTap to toggle ON/OFF:', {
+    parse_mode: 'HTML',
+    ...kb
+  }).catch(() => {});
+  await ctx.answerCbQuery();
+});
+
+bot.action(/toggle_time_(.+)/, async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
+  const selectedTime = ctx.match[1];
+  const db = await getDb();
+  const cfg = await getConfig(db);
+  let times = cfg.schedule_times || [];
+
+  times = times.includes(selectedTime) ? times.filter((t) => t !== selectedTime) : [...times, selectedTime];
+
+  await db.collection('settings').updateOne(
+    { _id: 'main_config' },
+    { $set: { schedule_times: times } }
+  );
+
+  const is5 = times.includes('05:00');
+  const is15 = times.includes('15:00');
+  const is20 = times.includes('20:00');
+
+  const kb = Markup.inlineKeyboard([
+    [Markup.button.callback(`🌅 Morning (05:00 AM) ${is5 ? '✅' : '▫️'}`, 'toggle_time_05:00')],
+    [Markup.button.callback(`🌇 Evening (03:00 PM) ${is15 ? '✅' : '▫️'}`, 'toggle_time_15:00')],
+    [Markup.button.callback(`🌙 Night (08:00 PM)   ${is20 ? '✅' : '▫️'}`, 'toggle_time_20:00')],
+    [Markup.button.callback('🔙 Back', 'admin_refresh')]
+  ]);
+
+  await ctx.editMessageText('⏰ <b>SELECT POSTING TIMES</b>\nTap to toggle ON/OFF:', {
+    parse_mode: 'HTML',
+    ...kb
+  }).catch(() => {});
+  await ctx.answerCbQuery();
+});
+
+// Batch Size UI
+bot.action('admin_ui_batch', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
+  const kb = Markup.inlineKeyboard([
+    [Markup.button.callback('5 Posts', 'set_batch_5'), Markup.button.callback('10 Posts', 'set_batch_10')],
+    [Markup.button.callback('15 Posts', 'set_batch_15'), Markup.button.callback('20 Posts', 'set_batch_20')],
+    [Markup.button.callback('🔙 Back', 'admin_refresh')]
+  ]);
+  await ctx.editMessageText('📦 <b>SELECT BATCH SIZE</b>\nChoose posts count per batch:', {
+    parse_mode: 'HTML',
+    ...kb
+  }).catch(() => {});
+  await ctx.answerCbQuery();
+});
+
+bot.action(/set_batch_(\d+)/, async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
+  const size = Number(ctx.match[1]);
+  const db = await getDb();
+  await db.collection('settings').updateOne(
+    { _id: 'main_config' },
+    { $set: { batch_size: size } }
+  );
+  await ctx.answerCbQuery(`Batch set to ${size}`);
+  const cfg = await getConfig(db);
+  await ctx.editMessageText(renderAdminText(cfg), {
+    parse_mode: 'HTML',
+    ...getAdminKeyboard(cfg)
+  }).catch(() => {});
+});
+
+// Channels UI
+bot.action('admin_ui_channels', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
+  const db = await getDb();
+  const cfg = await getConfig(db);
+
+  let text = `📢 <b>AUTO-APPROVE CHANNELS</b>\n\n`;
+  (cfg.approved_channels || []).forEach((ch, idx) => {
+    text += `${idx + 1}. <b>${ch.title}</b>\n`;
+  });
+
+  const buttons = [];
+  (cfg.approved_channels || []).forEach((ch) => {
+    buttons.push([Markup.button.callback(`🗑 Remove ${ch.title}`, `remove_ch_${ch.id}`)]);
+  });
+  buttons.push([Markup.button.callback('🔙 Back', 'admin_refresh')]);
+
+  await ctx.editMessageText(text, {
+    parse_mode: 'HTML',
+    ...Markup.inlineKeyboard(buttons)
+  }).catch(() => {});
+  await ctx.answerCbQuery();
+});
+
+bot.action(/remove_ch_(.+)/, async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
+  const chId = Number(ctx.match[1]);
+  const db = await getDb();
+  await db.collection('settings').updateOne(
+    { _id: 'main_config' },
+    { $pull: { approved_channels: { id: chId } } }
+  );
+  await ctx.answerCbQuery('Removed');
+  const cfg = await getConfig(db);
+
+  let text = `📢 <b>AUTO-APPROVE CHANNELS</b>\n\n`;
+  (cfg.approved_channels || []).forEach((ch, idx) => {
+    text += `${idx + 1}. <b>${ch.title}</b>\n`;
+  });
+
+  const buttons = [];
+  (cfg.approved_channels || []).forEach((ch) => {
+    buttons.push([Markup.button.callback(`🗑 Remove ${ch.title}`, `remove_ch_${ch.id}`)]);
+  });
+  buttons.push([Markup.button.callback('🔙 Back', 'admin_refresh')]);
+
+  await ctx.editMessageText(text, {
+    parse_mode: 'HTML',
+    ...Markup.inlineKeyboard(buttons)
+  }).catch(() => {});
+});
+
+// Serverless Gateway
 module.exports = async (req, res) => {
   try {
     const db = await getDb();
 
+    // Cron Ping Handler
     if (req.method === 'GET') {
-      res.status(200).json({ ok: true });
       const now = new Date();
       const slDate = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
       const hours = String(slDate.getUTCHours()).padStart(2, '0');
@@ -297,11 +406,12 @@ module.exports = async (req, res) => {
           { _id: 'main_config' },
           { $set: { last_posted_hour: timeKey } }
         );
-        runPostingBatch(db, false);
+        await runPostingBatch(db, false);
       }
-      return;
+      return res.status(200).json({ ok: true });
     }
 
+    // Webhook Updates Handler
     if (req.method === 'POST' && req.body) {
       await bot.handleUpdate(req.body);
       return res.status(200).json({ ok: true });
