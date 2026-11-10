@@ -1,7 +1,7 @@
 const { Telegraf, Markup } = require('telegraf');
 const { MongoClient } = require('mongodb');
 
-// --- Configuration & IDs ---
+// --- Configuration ---
 const BOT_TOKEN = process.env.BOT_TOKEN || '9251791914:AAHG26G5mVVShsQpF8PK1fvpWgmZ__FNPCk';
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://oprashmikayasiru_db_user:AMcK5sVpxXr3R7VT@cluster0.ulukf3s.mongodb.net/vibelk_tools_db?retryWrites=true&w=majority';
 const ADMIN_ID = Number(process.env.ADMIN_ID) || 5411921025;
@@ -11,7 +11,6 @@ const TARGET_CHANNEL_ID = -1004472514921; // VibeLK 🔥
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// --- Mongo Global Cache ---
 let cachedDb = null;
 let clientPromise = null;
 
@@ -40,7 +39,7 @@ async function getConfig(db) {
       is_active: true,
       batch_size: 5,
       schedule_times: ['05:00', '20:00'],
-      last_message_id: 8,
+      last_message_id: 7,
       last_posted_hour: null,
       approved_channels: [
         { id: SOURCE_CHANNEL_ID, title: 'Hot Lanka V2' },
@@ -52,9 +51,8 @@ async function getConfig(db) {
   return cfg;
 }
 
-// --- Bridge Processor: Forward -> Extract -> Instant Delete -> Clean Post ---
+// --- Bridge Processor: Forward -> Extract -> Delete Temp -> Clean Post ---
 async function copyWithExtractedButtons(msgId) {
-  // 1. Silent forward to Admin chat
   const forwarded = await bot.telegram.forwardMessage(
     ADMIN_ID,
     SOURCE_CHANNEL_ID,
@@ -65,10 +63,7 @@ async function copyWithExtractedButtons(msgId) {
   let targetMsg = null;
 
   try {
-    // 2. Extract original inline keyboard markup
     const originalMarkup = forwarded.reply_markup || undefined;
-
-    // 3. Re-brand caption / text
     let caption = forwarded.caption || forwarded.text || '';
     if (caption) {
       caption = caption.replace(/Hot Lanka/gi, 'VibeLK');
@@ -80,7 +75,6 @@ async function copyWithExtractedButtons(msgId) {
       reply_markup: originalMarkup
     };
 
-    // 4. Clean post directly to VibeLK (No Forward Tag)
     if (forwarded.photo && forwarded.photo.length > 0) {
       const highestPhoto = forwarded.photo[forwarded.photo.length - 1].file_id;
       targetMsg = await bot.telegram.sendPhoto(TARGET_CHANNEL_ID, highestPhoto, postOptions);
@@ -102,19 +96,18 @@ async function copyWithExtractedButtons(msgId) {
       });
     }
   } finally {
-    // 5. Always delete the temporary message from Admin chat immediately
     await bot.telegram.deleteMessage(ADMIN_ID, forwarded.message_id).catch(() => {});
   }
 
   return targetMsg;
 }
 
-// --- Posting Batch Loop ---
+// --- Batch Worker Execution ---
 async function runPostingBatch(db, manualTrigger = false) {
   const cfg = await getConfig(db);
   if (!cfg.is_active && !manualTrigger) return { posted: 0 };
 
-  let currentMsgId = cfg.last_message_id || 8;
+  let currentMsgId = cfg.last_message_id || 7;
   let postedCount = 0;
   const targetCount = cfg.batch_size || 5;
   let consecutiveErrors = 0;
@@ -154,7 +147,7 @@ async function runPostingBatch(db, manualTrigger = false) {
   return { posted: postedCount, nextId: currentMsgId };
 }
 
-// --- Auto-Approval Handler ---
+// --- Universal Auto-Approval ---
 bot.on('chat_join_request', async (ctx) => {
   try {
     const db = await getDb();
@@ -174,7 +167,7 @@ bot.on('chat_join_request', async (ctx) => {
   } catch (e) {}
 });
 
-// --- Admin Keyboard Helpers ---
+// --- UI Helpers ---
 function getAdminKeyboard(cfg) {
   const statusIcon = cfg.is_active ? '🟢 ACTIVE' : '🔴 PAUSED';
   return Markup.inlineKeyboard([
@@ -199,15 +192,26 @@ function renderAdminText(cfg) {
     `📦 <b>Batch:</b> ${cfg.batch_size} Posts\n` +
     `⏰ <b>Schedule:</b> ${timesStr}\n` +
     `📢 <b>Auto-Approve:</b> ${channelsCount} Channels\n` +
-    `📌 <b>Current Msg ID:</b> #${cfg.last_message_id || 8}`;
+    `📌 <b>Current Msg ID:</b> #${cfg.last_message_id || 7}`;
 }
 
-// --- Commands & Actions ---
 bot.command('admin', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   const db = await getDb();
   const cfg = await getConfig(db);
   await ctx.replyWithHTML(renderAdminText(cfg), getAdminKeyboard(cfg));
+});
+
+// Database History Reset Command
+bot.command('resetdb', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  const db = await getDb();
+  await db.collection('processed_posts').deleteMany({});
+  await db.collection('settings').updateOne(
+    { _id: 'main_config' },
+    { $set: { last_message_id: 7, is_posting_locked: false } }
+  );
+  await ctx.reply('🗑️ <b>Database Reset Complete!</b>\nAll processed post history has been cleared.\nNext Message ID set back to #7.', { parse_mode: 'HTML' });
 });
 
 bot.command('setid', async (ctx) => {
@@ -252,7 +256,7 @@ bot.action('admin_toggle_status', async (ctx) => {
 
 bot.action('admin_post_now', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
-  await ctx.answerCbQuery('🚀 Processing batch with buttons...');
+  await ctx.answerCbQuery('🚀 Starting batch...');
   const db = await getDb();
   
   const result = await runPostingBatch(db, true);
@@ -264,13 +268,13 @@ bot.action('admin_post_now', async (ctx) => {
   }).catch(() => {});
 
   if (result.posted > 0) {
-    await ctx.reply(`✅ <b>Success!</b> ${result.posted} posts published to VibeLK with buttons! 🔥\n📌 Next Message ID: #${result.nextId}`, { parse_mode: 'HTML' });
+    await ctx.reply(`✅ <b>Success!</b> ${result.posted} posts published to VibeLK! 🔥\n📌 Next Message ID: #${result.nextId}`, { parse_mode: 'HTML' });
   } else {
     await ctx.reply(`⚠️ No new posts were found starting from ID #${cfg.last_message_id}.`);
   }
 });
 
-// UI: Time Selection
+// UI: Times
 bot.action('admin_ui_times', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const db = await getDb();
@@ -359,7 +363,7 @@ bot.action(/set_batch_(\d+)/, async (ctx) => {
   }).catch(() => {});
 });
 
-// UI: Auto-Approve Channel Management
+// UI: Channels
 bot.action('admin_ui_channels', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const db = await getDb();
@@ -374,6 +378,7 @@ bot.action('admin_ui_channels', async (ctx) => {
   (cfg.approved_channels || []).forEach((ch) => {
     buttons.push([Markup.button.callback(`🗑 Remove ${ch.title}`, `remove_ch_${ch.id}`)]);
   });
+  buttons.push([Markup.button.callback('➕ Add Channel', 'admin_ui_add_ch')]);
   buttons.push([Markup.button.callback('🔙 Back', 'admin_refresh')]);
 
   await ctx.editMessageText(text, {
@@ -403,6 +408,7 @@ bot.action(/remove_ch_(.+)/, async (ctx) => {
   (cfg.approved_channels || []).forEach((ch) => {
     buttons.push([Markup.button.callback(`🗑 Remove ${ch.title}`, `remove_ch_${ch.id}`)]);
   });
+  buttons.push([Markup.button.callback('➕ Add Channel', 'admin_ui_add_ch')]);
   buttons.push([Markup.button.callback('🔙 Back', 'admin_refresh')]);
 
   await ctx.editMessageText(text, {
@@ -416,7 +422,6 @@ module.exports = async (req, res) => {
   try {
     const db = await getDb();
 
-    // Cron Trigger (Every 5 minutes)
     if (req.method === 'GET') {
       const now = new Date();
       const slDate = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
@@ -438,7 +443,6 @@ module.exports = async (req, res) => {
       return res.status(200).json({ ok: true, keepalive: true });
     }
 
-    // Telegram Updates Handler
     if (req.method === 'POST' && req.body) {
       await bot.handleUpdate(req.body);
       return res.status(200).json({ ok: true });
