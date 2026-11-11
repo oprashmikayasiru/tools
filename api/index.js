@@ -11,7 +11,7 @@ const TARGET_CHANNEL_ID = -1004472514921; // VibeLK 🔥
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// Register commands so they appear in Telegram menu only for Admin
+// Register commands for Admin only
 let commandsRegistered = false;
 async function setupAdminCommands() {
   if (commandsRegistered) return;
@@ -253,15 +253,24 @@ bot.command('admin', async (ctx) => {
   await ctx.replyWithHTML(renderAdminText(cfg), getAdminKeyboard(cfg));
 });
 
+// Reset Command with Safe Confirmation Prompt
 bot.command('resetdb', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
-  const db = await getDb();
-  await db.collection('processed_posts').deleteMany({});
-  await db.collection('settings').updateOne(
-    { _id: 'main_config' },
-    { $set: { last_message_id: 7, is_posting_locked: false, admin_state: null } }
+  await setupAdminCommands();
+  
+  const confirmKeyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback('⚠️ Yes, Reset Everything', 'confirm_reset_db'),
+      Markup.button.callback('❌ Cancel', 'cancel_reset_db')
+    ]
+  ]);
+
+  await ctx.replyWithHTML(
+    '⚠️ <b>CONFIRM DATABASE RESET</b>\n\n' +
+    'Are you sure you want to clear all processed post history?\n' +
+    'This will restart copying from Post ID #7.',
+    confirmKeyboard
   );
-  await ctx.reply('🗑️ <b>Database Reset Complete!</b>\nAll processed history cleared.\nNext Post ID reset to #7.', { parse_mode: 'HTML' });
 });
 
 bot.command('setid', async (ctx) => {
@@ -287,7 +296,31 @@ bot.command('cancel', async (ctx) => {
   await ctx.reply('❌ Action cancelled.');
 });
 
-// --- UI Actions (Simple English) ---
+// --- Confirmation Actions for Reset DB ---
+bot.action('confirm_reset_db', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
+  const db = await getDb();
+  
+  await db.collection('processed_posts').deleteMany({});
+  await db.collection('settings').updateOne(
+    { _id: 'main_config' },
+    { $set: { last_message_id: 7, is_posting_locked: false, admin_state: null } }
+  );
+
+  await ctx.editMessageText(
+    '🗑️ <b>Database Reset Complete!</b>\nAll processed history cleared.\nNext Post ID reset to #7.',
+    { parse_mode: 'HTML' }
+  ).catch(() => {});
+  await ctx.answerCbQuery('Database Reset Successful');
+});
+
+bot.action('cancel_reset_db', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
+  await ctx.editMessageText('❌ <b>Reset Cancelled.</b> No data was changed.', { parse_mode: 'HTML' }).catch(() => {});
+  await ctx.answerCbQuery('Cancelled');
+});
+
+// --- UI Actions ---
 bot.action('noop', (ctx) => ctx.answerCbQuery());
 
 bot.action('admin_refresh', async (ctx) => {
@@ -500,6 +533,7 @@ bot.action(/remove_ch_(.+)/, async (ctx) => {
   (cfg.approved_channels || []).forEach((ch) => {
     buttons.push([Markup.button.callback(`🗑 Remove ${ch.title}`, `remove_ch_${ch.id}`)]);
   });
+  buttons.push([Markup.button.callback('➕ Add Channel', 'admin_ui_add_ch')]);
   buttons.push([Markup.button.callback('🔙 Back', 'admin_refresh')]);
 
   await ctx.editMessageText(text, {
