@@ -42,6 +42,7 @@ async function getConfig(db) {
       schedule_times: ['05:00', '20:00'],
       last_message_id: 7,
       last_posted_hour: null,
+      admin_state: null,
       approved_channels: [
         { id: SOURCE_CHANNEL_ID, title: 'Hot Lanka V2' },
         { id: TARGET_CHANNEL_ID, title: 'VibeLK 🔥' }
@@ -54,7 +55,6 @@ async function getConfig(db) {
 
 // --- Bridge Processor: Forward -> Extract -> Delete Temp -> Dynamic Quote Post ---
 async function copyWithExtractedButtons(msgId) {
-  // 1. Silent forward to Admin chat
   const forwarded = await bot.telegram.forwardMessage(
     ADMIN_ID,
     SOURCE_CHANNEL_ID,
@@ -67,7 +67,6 @@ async function copyWithExtractedButtons(msgId) {
   try {
     const originalMarkup = forwarded.reply_markup || undefined;
 
-    // Check if the original message had blockquote formatting
     const entities = forwarded.caption_entities || forwarded.entities || [];
     const hasQuote = entities.some(
       (e) => e.type === 'blockquote' || e.type === 'expandable_blockquote'
@@ -78,8 +77,6 @@ async function copyWithExtractedButtons(msgId) {
 
     if (rawCaption) {
       rawCaption = rawCaption.replace(/Hot Lanka/gi, 'VibeLK');
-      
-      // මුල් post එකේ Quote එකක් තිබුණා නම් පමණක් blockquote එක යොදයි
       if (hasQuote) {
         finalCaption = `<blockquote>${rawCaption}</blockquote>`;
       } else {
@@ -93,7 +90,6 @@ async function copyWithExtractedButtons(msgId) {
       reply_markup: originalMarkup
     };
 
-    // Clean post directly to VibeLK (No Forward Tag)
     if (forwarded.photo && forwarded.photo.length > 0) {
       const highestPhoto = forwarded.photo[forwarded.photo.length - 1].file_id;
       targetMsg = await bot.telegram.sendPhoto(TARGET_CHANNEL_ID, highestPhoto, postOptions);
@@ -116,7 +112,6 @@ async function copyWithExtractedButtons(msgId) {
       });
     }
   } finally {
-    // Delete temporary message from Admin chat immediately
     await bot.telegram.deleteMessage(ADMIN_ID, forwarded.message_id).catch(() => {});
   }
 
@@ -216,7 +211,25 @@ function renderAdminText(cfg) {
     `📌 <b>Current Msg ID:</b> #${cfg.last_message_id || 7}`;
 }
 
-// --- Commands & Actions ---
+// Dynamic Times Keyboard Builder
+function getTimesKeyboard(times) {
+  const buttons = [];
+  
+  // Existing times with remove button
+  (times || []).sort().forEach((t) => {
+    buttons.push([
+      Markup.button.callback(`🕒 ${t}`, 'noop'),
+      Markup.button.callback(`❌ Remove`, `del_time_${t}`)
+    ]);
+  });
+
+  buttons.push([Markup.button.callback('➕ Add Custom Time', 'admin_ui_add_time')]);
+  buttons.push([Markup.button.callback('🔙 Back to Menu', 'admin_refresh')]);
+
+  return Markup.inlineKeyboard(buttons);
+}
+
+// --- Commands (Strictly Admin Only) ---
 bot.command('admin', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   const db = await getDb();
@@ -230,9 +243,9 @@ bot.command('resetdb', async (ctx) => {
   await db.collection('processed_posts').deleteMany({});
   await db.collection('settings').updateOne(
     { _id: 'main_config' },
-    { $set: { last_message_id: 7, is_posting_locked: false } }
+    { $set: { last_message_id: 7, is_posting_locked: false, admin_state: null } }
   );
-  await ctx.reply('🗑️ <b>Database Reset Complete!</b>\nAll processed post history has been cleared.\nNext Message ID set back to #7.', { parse_mode: 'HTML' });
+  await ctx.reply('🗑️ <b>Database Reset Complete!</b>\nAll processed post history cleared. ID reset to #7.', { parse_mode: 'HTML' });
 });
 
 bot.command('setid', async (ctx) => {
@@ -247,6 +260,19 @@ bot.command('setid', async (ctx) => {
   );
   await ctx.reply(`✅ Next Message ID set to #${newId}`);
 });
+
+bot.command('cancel', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  const db = await getDb();
+  await db.collection('settings').updateOne(
+    { _id: 'main_config' },
+    { $set: { admin_state: null } }
+  );
+  await ctx.reply('❌ Action cancelled.');
+});
+
+// --- UI Actions ---
+bot.action('noop', (ctx) => ctx.answerCbQuery());
 
 bot.action('admin_refresh', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
@@ -295,64 +321,97 @@ bot.action('admin_post_now', async (ctx) => {
   }
 });
 
-// UI: Time Selection
+// --- Dynamic Times UI Menu ---
 bot.action('admin_ui_times', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const db = await getDb();
   const cfg = await getConfig(db);
-  const activeTimes = cfg.schedule_times || [];
 
-  const is5 = activeTimes.includes('05:00');
-  const is15 = activeTimes.includes('15:00');
-  const is20 = activeTimes.includes('20:00');
-
-  const kb = Markup.inlineKeyboard([
-    [Markup.button.callback(`🌅 Morning (05:00 AM) ${is5 ? '✅' : '▫️'}`, 'toggle_time_05:00')],
-    [Markup.button.callback(`🌇 Evening (03:00 PM) ${is15 ? '✅' : '▫️'}`, 'toggle_time_15:00')],
-    [Markup.button.callback(`🌙 Night (08:00 PM)   ${is20 ? '✅' : '▫️'}`, 'toggle_time_20:00')],
-    [Markup.button.callback('🔙 Back', 'admin_refresh')]
-  ]);
-
-  await ctx.editMessageText('⏰ <b>SELECT POSTING TIMES</b>\nTap to toggle ON/OFF:', {
-    parse_mode: 'HTML',
-    ...kb
-  }).catch(() => {});
+  await ctx.editMessageText(
+    '⏰ <b>CUSTOM SCHEDULE TIMES</b>\n\nඔබට අවශ්‍ය වේලාවන් මෙතැනින් කළමනාකරණය කරන්න:\n(වේලාව 24-hour format එකෙන් තබාගන්න. උදා: <code>09:30</code>, <code>20:00</code>)',
+    {
+      parse_mode: 'HTML',
+      ...getTimesKeyboard(cfg.schedule_times)
+    }
+  ).catch(() => {});
   await ctx.answerCbQuery();
 });
 
-bot.action(/toggle_time_(.+)/, async (ctx) => {
+// Prompt Admin to send Time via Chat
+bot.action('admin_ui_add_time', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
-  const selectedTime = ctx.match[1];
   const db = await getDb();
-  const cfg = await getConfig(db);
-  let times = cfg.schedule_times || [];
-
-  times = times.includes(selectedTime) ? times.filter((t) => t !== selectedTime) : [...times, selectedTime];
-
+  
+  // Set state waiting for input
   await db.collection('settings').updateOne(
     { _id: 'main_config' },
-    { $set: { schedule_times: times } }
+    { $set: { admin_state: 'waiting_for_time' } }
   );
 
-  const is5 = times.includes('05:00');
-  const is15 = times.includes('15:00');
-  const is20 = times.includes('20:00');
-
-  const kb = Markup.inlineKeyboard([
-    [Markup.button.callback(`🌅 Morning (05:00 AM) ${is5 ? '✅' : '▫️'}`, 'toggle_time_05:00')],
-    [Markup.button.callback(`🌇 Evening (03:00 PM) ${is15 ? '✅' : '▫️'}`, 'toggle_time_15:00')],
-    [Markup.button.callback(`🌙 Night (08:00 PM)   ${is20 ? '✅' : '▫️'}`, 'toggle_time_20:00')],
-    [Markup.button.callback('🔙 Back', 'admin_refresh')]
-  ]);
-
-  await ctx.editMessageText('⏰ <b>SELECT POSTING TIMES</b>\nTap to toggle ON/OFF:', {
-    parse_mode: 'HTML',
-    ...kb
-  }).catch(() => {});
+  await ctx.reply(
+    '✍️ <b>ඔබට Post වීමට අවශ්‍ය වේලාව එවන්න:</b>\n\n(24-hour format එකෙන් එවන්න. උදා: <code>08:30</code>, <code>14:15</code>, <code>21:00</code>)\n\n<i>අවලංගු කිරීමට /cancel යවන්න.</i>',
+    { parse_mode: 'HTML' }
+  );
   await ctx.answerCbQuery();
 });
 
-// UI: Batch Size
+// Delete specific time from UI
+bot.action(/del_time_(.+)/, async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
+  const timeToRemove = ctx.match[1];
+  const db = await getDb();
+  
+  await db.collection('settings').updateOne(
+    { _id: 'main_config' },
+    { $pull: { schedule_times: timeToRemove } }
+  );
+
+  const cfg = await getConfig(db);
+  await ctx.editMessageText(
+    '⏰ <b>CUSTOM SCHEDULE TIMES</b>\n\nඔබට අවශ්‍ය වේලාවන් මෙතැනින් කළමනාකරණය කරන්න:',
+    {
+      parse_mode: 'HTML',
+      ...getTimesKeyboard(cfg.schedule_times)
+    }
+  ).catch(() => {});
+  await ctx.answerCbQuery(`Removed ${timeToRemove}`);
+});
+
+// --- Text Handler for Adding Custom Time ---
+bot.on('text', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  const text = ctx.message.text.trim();
+  const db = await getDb();
+  const cfg = await getConfig(db);
+
+  if (cfg.admin_state === 'waiting_for_time') {
+    // Validate HH:MM format (00:00 to 23:59)
+    const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
+    if (!timeRegex.test(text)) {
+      return ctx.reply('⚠️ <b>වැරදි Format එකක්!</b> කරුණාකර <code>HH:MM</code> ආකාරයෙන් එවන්න (උදා: <code>09:30</code>, <code>18:00</code>):', { parse_mode: 'HTML' });
+    }
+
+    // Format time properly (e.g., 9:30 -> 09:30)
+    const parts = text.split(':');
+    const formattedTime = `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}`;
+
+    await db.collection('settings').updateOne(
+      { _id: 'main_config' },
+      { 
+        $addToSet: { schedule_times: formattedTime },
+        $set: { admin_state: null }
+      }
+    );
+
+    const updatedCfg = await getConfig(db);
+    await ctx.reply(`✅ <b>${formattedTime}</b> වේලාව සාර්ථකව Schedule එකට එකතු කළා!`, {
+      parse_mode: 'HTML',
+      ...getTimesKeyboard(updatedCfg.schedule_times)
+    });
+  }
+});
+
+// --- UI: Batch Size ---
 bot.action('admin_ui_batch', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const kb = Markup.inlineKeyboard([
@@ -384,7 +443,7 @@ bot.action(/set_batch_(\d+)/, async (ctx) => {
   }).catch(() => {});
 });
 
-// UI: Channels
+// --- UI: Auto-Approve Channels ---
 bot.action('admin_ui_channels', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const db = await getDb();
@@ -399,7 +458,6 @@ bot.action('admin_ui_channels', async (ctx) => {
   (cfg.approved_channels || []).forEach((ch) => {
     buttons.push([Markup.button.callback(`🗑 Remove ${ch.title}`, `remove_ch_${ch.id}`)]);
   });
-  buttons.push([Markup.button.callback('➕ Add Channel', 'admin_ui_add_ch')]);
   buttons.push([Markup.button.callback('🔙 Back', 'admin_refresh')]);
 
   await ctx.editMessageText(text, {
@@ -429,7 +487,6 @@ bot.action(/remove_ch_(.+)/, async (ctx) => {
   (cfg.approved_channels || []).forEach((ch) => {
     buttons.push([Markup.button.callback(`🗑 Remove ${ch.title}`, `remove_ch_${ch.id}`)]);
   });
-  buttons.push([Markup.button.callback('➕ Add Channel', 'admin_ui_add_ch')]);
   buttons.push([Markup.button.callback('🔙 Back', 'admin_refresh')]);
 
   await ctx.editMessageText(text, {
@@ -438,33 +495,44 @@ bot.action(/remove_ch_(.+)/, async (ctx) => {
   }).catch(() => {});
 });
 
-// --- Serverless Gateway ---
+// --- Serverless Gateway (Webhook & Minute-based Cron Check) ---
 module.exports = async (req, res) => {
   try {
     const db = await getDb();
 
-    // Cron Ping Handler
+    // Cron Ping Handler (Runs every 5 minutes from cron-job.org)
     if (req.method === 'GET') {
       const now = new Date();
+      // Sri Lanka Time (UTC + 5:30)
       const slDate = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
       const hours = String(slDate.getUTCHours()).padStart(2, '0');
-      const timeKey = `${hours}:00`;
+      const minutes = slDate.getUTCMinutes();
 
       const cfg = await getConfig(db);
-      if (
-        cfg.is_active &&
-        (cfg.schedule_times || []).includes(timeKey) &&
-        cfg.last_posted_hour !== timeKey
-      ) {
-        await db.collection('settings').updateOne(
-          { _id: 'main_config' },
-          { $set: { last_posted_hour: timeKey } }
-        );
-        await runPostingBatch(db, false);
+
+      if (cfg.is_active && (cfg.schedule_times || []).length > 0) {
+        // Check if any scheduled time falls within the current 5-minute cron window
+        const matchedTime = cfg.schedule_times.find((t) => {
+          const [tHour, tMin] = t.split(':').map(Number);
+          return (
+            Number(hours) === tHour &&
+            Math.abs(minutes - tMin) < 5
+          );
+        });
+
+        if (matchedTime && cfg.last_posted_hour !== matchedTime) {
+          await db.collection('settings').updateOne(
+            { _id: 'main_config' },
+            { $set: { last_posted_hour: matchedTime } }
+          );
+          await runPostingBatch(db, false);
+        }
       }
+
       return res.status(200).json({ ok: true, keepalive: true });
     }
 
+    // Telegram Updates Handler
     if (req.method === 'POST' && req.body) {
       await bot.handleUpdate(req.body);
       return res.status(200).json({ ok: true });
