@@ -1,17 +1,21 @@
 const { Telegraf, Markup } = require('telegraf');
 const { MongoClient } = require('mongodb');
 
-// --- Configuration & IDs ---
-const BOT_TOKEN = process.env.BOT_TOKEN || '9251791914:AAHG26G5mVVShsQpF8PK1fvpWgmZ__FNPCk';
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://oprashmikayasiru_db_user:AMcK5sVpxXr3R7VT@cluster0.ulukf3s.mongodb.net/vibelk_tools_db?retryWrites=true&w=majority';
+// --- Configurations & Credentials (Strictly from Environment Variables) ---
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const MONGODB_URI = process.env.MONGODB_URI;
 const ADMIN_ID = Number(process.env.ADMIN_ID) || 5411921025;
 
 const SOURCE_CHANNEL_ID = -1004309315754; // Hot Lanka V2
 const TARGET_CHANNEL_ID = -1004472514921; // VibeLK 🔥
 
+if (!BOT_TOKEN || !MONGODB_URI) {
+  console.error("Missing BOT_TOKEN or MONGODB_URI in environment variables!");
+}
+
 const bot = new Telegraf(BOT_TOKEN);
 
-// Register commands for Admin only
+// Register commands for Admin only in Telegram UI Menu
 let commandsRegistered = false;
 async function setupAdminCommands() {
   if (commandsRegistered) return;
