@@ -1,7 +1,7 @@
 const { Telegraf, Markup } = require('telegraf');
 const { MongoClient } = require('mongodb');
-  
-// --- Configurations & Credentials (Strictly from  Environment Variables) ---
+
+// --- Configurations & Credentials (From Environment Variables) ---
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const MONGODB_URI = process.env.MONGODB_URI;
 const ADMIN_ID = Number(process.env.ADMIN_ID) || 5411921025;
@@ -75,7 +75,28 @@ async function getConfig(db) {
   return cfg;
 }
 
-// --- Bridge Processor: Forward -> Extract -> Delete Temp -> Dynamic Quote Post ---
+// --- Formats Quote exactly as the original post ---
+function applyExactEntities(text, entities) {
+  if (!text) return '';
+  if (!entities || entities.length === 0) return text;
+
+  const quoteEntity = entities.find(
+    (e) => e.type === 'blockquote' || e.type === 'expandable_blockquote'
+  );
+
+  if (!quoteEntity) return text;
+
+  const start = quoteEntity.offset;
+  const end = quoteEntity.offset + quoteEntity.length;
+
+  const before = text.substring(0, start);
+  const quotePart = text.substring(start, end);
+  const after = text.substring(end);
+
+  return `${before}<blockquote>${quotePart}</blockquote>${after}`;
+}
+
+// --- Bridge Processor: Forward -> Extract -> Delete Temp -> Exact Structure Post ---
 async function copyWithExtractedButtons(msgId) {
   const forwarded = await bot.telegram.forwardMessage(
     ADMIN_ID,
@@ -88,26 +109,17 @@ async function copyWithExtractedButtons(msgId) {
 
   try {
     const originalMarkup = forwarded.reply_markup || undefined;
-
+    const rawText = forwarded.caption || forwarded.text || '';
     const entities = forwarded.caption_entities || forwarded.entities || [];
-    const hasQuote = entities.some(
-      (e) => e.type === 'blockquote' || e.type === 'expandable_blockquote'
-    );
 
-    let rawCaption = forwarded.caption || forwarded.text || '';
-    let finalCaption = '';
+    // 1. Apply Quote tag ONLY to the part that was originally quoted
+    let formattedText = applyExactEntities(rawText, entities);
 
-    if (rawCaption) {
-      rawCaption = rawCaption.replace(/Hot Lanka/gi, 'VibeLK');
-      if (hasQuote) {
-        finalCaption = `<blockquote>${rawCaption}</blockquote>`;
-      } else {
-        finalCaption = rawCaption;
-      }
-    }
+    // 2. Rebrand Hot Lanka -> VibeLK
+    formattedText = formattedText.replace(/Hot Lanka/gi, 'VibeLK');
 
     const postOptions = {
-      caption: finalCaption,
+      caption: formattedText,
       parse_mode: 'HTML',
       reply_markup: originalMarkup
     };
@@ -122,13 +134,13 @@ async function copyWithExtractedButtons(msgId) {
     } else if (forwarded.animation) {
       targetMsg = await bot.telegram.sendAnimation(TARGET_CHANNEL_ID, forwarded.animation.file_id, postOptions);
     } else if (forwarded.text) {
-      targetMsg = await bot.telegram.sendMessage(TARGET_CHANNEL_ID, finalCaption, {
+      targetMsg = await bot.telegram.sendMessage(TARGET_CHANNEL_ID, formattedText, {
         parse_mode: 'HTML',
         reply_markup: originalMarkup
       });
     } else {
       targetMsg = await bot.telegram.copyMessage(TARGET_CHANNEL_ID, SOURCE_CHANNEL_ID, msgId, {
-        caption: finalCaption,
+        caption: formattedText,
         parse_mode: 'HTML',
         reply_markup: originalMarkup
       });
