@@ -1,7 +1,7 @@
 const { Telegraf, Markup } = require('telegraf');
 const { MongoClient } = require('mongodb');
  
-// --- Configurations & Credentials (Strictly from Environment Variables) ---
+// --- Configurations & Credentials (Strictly from  Environment Variables) ---
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const MONGODB_URI = process.env.MONGODB_URI;
 const ADMIN_ID = Number(process.env.ADMIN_ID) || 5411921025;
