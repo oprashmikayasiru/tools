@@ -11,6 +11,24 @@ const TARGET_CHANNEL_ID = -1004472514921; // VibeLK 🔥
 
 const bot = new Telegraf(BOT_TOKEN);
 
+// Register commands so they appear in Telegram menu only for Admin
+let commandsRegistered = false;
+async function setupAdminCommands() {
+  if (commandsRegistered) return;
+  try {
+    await bot.telegram.setMyCommands(
+      [
+        { command: 'admin', description: 'Open Control Dashboard' },
+        { command: 'resetdb', description: 'Reset Database History & ID' },
+        { command: 'setid', description: 'Set Custom Message ID' },
+        { command: 'cancel', description: 'Cancel Current Action' }
+      ],
+      { scope: { type: 'chat', chat_id: ADMIN_ID } }
+    );
+    commandsRegistered = true;
+  } catch (err) {}
+}
+
 // --- Mongo Global Cache ---
 let cachedDb = null;
 let clientPromise = null;
@@ -183,7 +201,7 @@ bot.on('chat_join_request', async (ctx) => {
   } catch (e) {}
 });
 
-// --- Admin Keyboard Helpers ---
+// --- Simple English Admin Keyboard Helpers ---
 function getAdminKeyboard(cfg) {
   const statusIcon = cfg.is_active ? '🟢 ACTIVE' : '🔴 PAUSED';
   return Markup.inlineKeyboard([
@@ -203,19 +221,16 @@ function getAdminKeyboard(cfg) {
 function renderAdminText(cfg) {
   const timesStr = (cfg.schedule_times || []).join(', ') || 'None';
   const channelsCount = (cfg.approved_channels || []).length;
-  return `⚙️ <b>TOOLS CONTROL</b>\n\n` +
+  return `⚙️ <b>CONTROL PANEL</b>\n\n` +
     `📊 <b>Status:</b> ${cfg.is_active ? '🟢 ACTIVE' : '🔴 PAUSED'}\n` +
     `📦 <b>Batch:</b> ${cfg.batch_size} Posts\n` +
     `⏰ <b>Schedule:</b> ${timesStr}\n` +
     `📢 <b>Auto-Approve:</b> ${channelsCount} Channels\n` +
-    `📌 <b>Current Msg ID:</b> #${cfg.last_message_id || 7}`;
+    `📌 <b>Current Post ID:</b> #${cfg.last_message_id || 7}`;
 }
 
-// Dynamic Times Keyboard Builder
 function getTimesKeyboard(times) {
   const buttons = [];
-  
-  // Existing times with remove button
   (times || []).sort().forEach((t) => {
     buttons.push([
       Markup.button.callback(`🕒 ${t}`, 'noop'),
@@ -232,6 +247,7 @@ function getTimesKeyboard(times) {
 // --- Commands (Strictly Admin Only) ---
 bot.command('admin', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
+  await setupAdminCommands();
   const db = await getDb();
   const cfg = await getConfig(db);
   await ctx.replyWithHTML(renderAdminText(cfg), getAdminKeyboard(cfg));
@@ -245,7 +261,7 @@ bot.command('resetdb', async (ctx) => {
     { _id: 'main_config' },
     { $set: { last_message_id: 7, is_posting_locked: false, admin_state: null } }
   );
-  await ctx.reply('🗑️ <b>Database Reset Complete!</b>\nAll processed post history cleared. ID reset to #7.', { parse_mode: 'HTML' });
+  await ctx.reply('🗑️ <b>Database Reset Complete!</b>\nAll processed history cleared.\nNext Post ID reset to #7.', { parse_mode: 'HTML' });
 });
 
 bot.command('setid', async (ctx) => {
@@ -258,7 +274,7 @@ bot.command('setid', async (ctx) => {
     { _id: 'main_config' },
     { $set: { last_message_id: newId } }
   );
-  await ctx.reply(`✅ Next Message ID set to #${newId}`);
+  await ctx.reply(`✅ Next Post ID set to #${newId}`);
 });
 
 bot.command('cancel', async (ctx) => {
@@ -271,7 +287,7 @@ bot.command('cancel', async (ctx) => {
   await ctx.reply('❌ Action cancelled.');
 });
 
-// --- UI Actions ---
+// --- UI Actions (Simple English) ---
 bot.action('noop', (ctx) => ctx.answerCbQuery());
 
 bot.action('admin_refresh', async (ctx) => {
@@ -303,7 +319,7 @@ bot.action('admin_toggle_status', async (ctx) => {
 
 bot.action('admin_post_now', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
-  await ctx.answerCbQuery('🚀 Processing batch...');
+  await ctx.answerCbQuery('🚀 Posting batch in progress...');
   const db = await getDb();
   
   const result = await runPostingBatch(db, true);
@@ -315,20 +331,20 @@ bot.action('admin_post_now', async (ctx) => {
   }).catch(() => {});
 
   if (result.posted > 0) {
-    await ctx.reply(`✅ <b>Success!</b> ${result.posted} posts published to VibeLK! 🔥\n📌 Next Message ID: #${result.nextId}`, { parse_mode: 'HTML' });
+    await ctx.reply(`✅ <b>Success!</b> ${result.posted} posts published to VibeLK!\n📌 Next Post ID: #${result.nextId}`, { parse_mode: 'HTML' });
   } else {
     await ctx.reply(`⚠️ No new posts were found starting from ID #${cfg.last_message_id}.`);
   }
 });
 
-// --- Dynamic Times UI Menu ---
+// Times Menu
 bot.action('admin_ui_times', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const db = await getDb();
   const cfg = await getConfig(db);
 
   await ctx.editMessageText(
-    '⏰ <b>CUSTOM SCHEDULE TIMES</b>\n\nඔබට අවශ්‍ය වේලාවන් මෙතැනින් කළමනාකරණය කරන්න:\n(වේලාව 24-hour format එකෙන් තබාගන්න. උදා: <code>09:30</code>, <code>20:00</code>)',
+    '⏰ <b>SCHEDULE TIMES</b>\n\nManage your auto-posting times below:\n(Use 24-hour format, e.g., <code>09:30</code>, <code>20:00</code>)',
     {
       parse_mode: 'HTML',
       ...getTimesKeyboard(cfg.schedule_times)
@@ -337,25 +353,24 @@ bot.action('admin_ui_times', async (ctx) => {
   await ctx.answerCbQuery();
 });
 
-// Prompt Admin to send Time via Chat
+// Prompt Admin to send Time
 bot.action('admin_ui_add_time', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const db = await getDb();
   
-  // Set state waiting for input
   await db.collection('settings').updateOne(
     { _id: 'main_config' },
     { $set: { admin_state: 'waiting_for_time' } }
   );
 
   await ctx.reply(
-    '✍️ <b>ඔබට Post වීමට අවශ්‍ය වේලාව එවන්න:</b>\n\n(24-hour format එකෙන් එවන්න. උදා: <code>08:30</code>, <code>14:15</code>, <code>21:00</code>)\n\n<i>අවලංගු කිරීමට /cancel යවන්න.</i>',
+    '✍️ <b>Enter the posting time:</b>\n\n(Use 24-hour format: e.g. <code>08:30</code>, <code>14:15</code>, <code>21:00</code>)\n\n<i>Send /cancel to discard.</i>',
     { parse_mode: 'HTML' }
   );
   await ctx.answerCbQuery();
 });
 
-// Delete specific time from UI
+// Remove Time
 bot.action(/del_time_(.+)/, async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const timeToRemove = ctx.match[1];
@@ -368,7 +383,7 @@ bot.action(/del_time_(.+)/, async (ctx) => {
 
   const cfg = await getConfig(db);
   await ctx.editMessageText(
-    '⏰ <b>CUSTOM SCHEDULE TIMES</b>\n\nඔබට අවශ්‍ය වේලාවන් මෙතැනින් කළමනාකරණය කරන්න:',
+    '⏰ <b>SCHEDULE TIMES</b>\n\nManage your auto-posting times below:',
     {
       parse_mode: 'HTML',
       ...getTimesKeyboard(cfg.schedule_times)
@@ -377,7 +392,7 @@ bot.action(/del_time_(.+)/, async (ctx) => {
   await ctx.answerCbQuery(`Removed ${timeToRemove}`);
 });
 
-// --- Text Handler for Adding Custom Time ---
+// Add Time via Chat Text
 bot.on('text', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   const text = ctx.message.text.trim();
@@ -385,13 +400,11 @@ bot.on('text', async (ctx) => {
   const cfg = await getConfig(db);
 
   if (cfg.admin_state === 'waiting_for_time') {
-    // Validate HH:MM format (00:00 to 23:59)
     const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
     if (!timeRegex.test(text)) {
-      return ctx.reply('⚠️ <b>වැරදි Format එකක්!</b> කරුණාකර <code>HH:MM</code> ආකාරයෙන් එවන්න (උදා: <code>09:30</code>, <code>18:00</code>):', { parse_mode: 'HTML' });
+      return ctx.reply('⚠️ <b>Invalid format!</b> Please use <code>HH:MM</code> format (e.g. <code>09:30</code>, <code>18:00</code>):', { parse_mode: 'HTML' });
     }
 
-    // Format time properly (e.g., 9:30 -> 09:30)
     const parts = text.split(':');
     const formattedTime = `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}`;
 
@@ -404,14 +417,14 @@ bot.on('text', async (ctx) => {
     );
 
     const updatedCfg = await getConfig(db);
-    await ctx.reply(`✅ <b>${formattedTime}</b> වේලාව සාර්ථකව Schedule එකට එකතු කළා!`, {
+    await ctx.reply(`✅ <b>${formattedTime}</b> added to schedule!`, {
       parse_mode: 'HTML',
       ...getTimesKeyboard(updatedCfg.schedule_times)
     });
   }
 });
 
-// --- UI: Batch Size ---
+// UI: Batch Size
 bot.action('admin_ui_batch', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const kb = Markup.inlineKeyboard([
@@ -420,7 +433,7 @@ bot.action('admin_ui_batch', async (ctx) => {
     [Markup.button.callback('25 Posts', 'set_batch_25'), Markup.button.callback('30 Posts', 'set_batch_30')],
     [Markup.button.callback('🔙 Back', 'admin_refresh')]
   ]);
-  await ctx.editMessageText('📦 <b>SELECT BATCH SIZE</b>\nChoose posts count per batch:', {
+  await ctx.editMessageText('📦 <b>BATCH SIZE</b>\nChoose posts count per batch:', {
     parse_mode: 'HTML',
     ...kb
   }).catch(() => {});
@@ -443,7 +456,7 @@ bot.action(/set_batch_(\d+)/, async (ctx) => {
   }).catch(() => {});
 });
 
-// --- UI: Auto-Approve Channels ---
+// UI: Auto-Approve Channels
 bot.action('admin_ui_channels', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const db = await getDb();
@@ -495,15 +508,14 @@ bot.action(/remove_ch_(.+)/, async (ctx) => {
   }).catch(() => {});
 });
 
-// --- Serverless Gateway (Webhook & Minute-based Cron Check) ---
+// --- Serverless Gateway ---
 module.exports = async (req, res) => {
   try {
     const db = await getDb();
 
-    // Cron Ping Handler (Runs every 5 minutes from cron-job.org)
+    // Cron Ping Handler
     if (req.method === 'GET') {
       const now = new Date();
-      // Sri Lanka Time (UTC + 5:30)
       const slDate = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
       const hours = String(slDate.getUTCHours()).padStart(2, '0');
       const minutes = slDate.getUTCMinutes();
@@ -511,7 +523,6 @@ module.exports = async (req, res) => {
       const cfg = await getConfig(db);
 
       if (cfg.is_active && (cfg.schedule_times || []).length > 0) {
-        // Check if any scheduled time falls within the current 5-minute cron window
         const matchedTime = cfg.schedule_times.find((t) => {
           const [tHour, tMin] = t.split(':').map(Number);
           return (
@@ -532,7 +543,7 @@ module.exports = async (req, res) => {
       return res.status(200).json({ ok: true, keepalive: true });
     }
 
-    // Telegram Updates Handler
+    // Telegram Updates
     if (req.method === 'POST' && req.body) {
       await bot.handleUpdate(req.body);
       return res.status(200).json({ ok: true });
