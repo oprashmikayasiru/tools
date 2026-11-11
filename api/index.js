@@ -75,28 +75,59 @@ async function getConfig(db) {
   return cfg;
 }
 
-// --- Formats Quote exactly as the original post ---
-function applyExactEntities(text, entities) {
+// --- Entity-Based HTML Rebuilder (Preserves Bold, Quote, Italic, Links, etc.) ---
+function rebuildHtmlWithEntities(text, entities) {
   if (!text) return '';
   if (!entities || entities.length === 0) return text;
 
-  const quoteEntity = entities.find(
-    (e) => e.type === 'blockquote' || e.type === 'expandable_blockquote'
-  );
+  // Insert HTML tags based on Telegram entity offsets
+  const tags = [];
+  entities.forEach((e) => {
+    let openTag = '';
+    let closeTag = '';
 
-  if (!quoteEntity) return text;
+    if (e.type === 'bold') {
+      openTag = '<b>';
+      closeTag = '</b>';
+    } else if (e.type === 'italic') {
+      openTag = '<i>';
+      closeTag = '</i>';
+    } else if (e.type === 'blockquote' || e.type === 'expandable_blockquote') {
+      openTag = '<blockquote>';
+      closeTag = '</blockquote>';
+    } else if (e.type === 'code') {
+      openTag = '<code>';
+      closeTag = '</code>';
+    } else if (e.type === 'text_link') {
+      openTag = `<a href="${e.url}">`;
+      closeTag = '</a>';
+    }
 
-  const start = quoteEntity.offset;
-  const end = quoteEntity.offset + quoteEntity.length;
+    if (openTag && closeTag) {
+      tags.push({ pos: e.offset, tag: openTag, isClose: false });
+      tags.push({ pos: e.offset + e.length, tag: closeTag, isClose: true });
+    }
+  });
 
-  const before = text.substring(0, start);
-  const quotePart = text.substring(start, end);
-  const after = text.substring(end);
+  // Sort tags: higher position first, if same position close tags come first
+  tags.sort((a, b) => {
+    if (a.pos !== b.pos) return b.pos - a.pos;
+    if (a.isClose && !b.isClose) return -1;
+    if (!a.isClose && b.isClose) return 1;
+    return 0;
+  });
 
-  return `${before}<blockquote>${quotePart}</blockquote>${after}`;
+  let result = text;
+  for (const t of tags) {
+    if (t.pos <= result.length) {
+      result = result.slice(0, t.pos) + t.tag + result.slice(t.pos);
+    }
+  }
+
+  return result;
 }
 
-// --- Bridge Processor: Forward -> Extract -> Delete Temp -> Exact Structure Post ---
+// --- Bridge Processor: Forward -> Extract -> Delete Temp -> Dynamic Rebuilt Post ---
 async function copyWithExtractedButtons(msgId) {
   const forwarded = await bot.telegram.forwardMessage(
     ADMIN_ID,
@@ -112,10 +143,10 @@ async function copyWithExtractedButtons(msgId) {
     const rawText = forwarded.caption || forwarded.text || '';
     const entities = forwarded.caption_entities || forwarded.entities || [];
 
-    // 1. Apply Quote tag ONLY to the part that was originally quoted
-    let formattedText = applyExactEntities(rawText, entities);
+    // Rebuild complete formatting (Bold Title + Quote Box intact)
+    let formattedText = rebuildHtmlWithEntities(rawText, entities);
 
-    // 2. Rebrand Hot Lanka -> VibeLK
+    // Re-brand Hot Lanka -> VibeLK
     formattedText = formattedText.replace(/Hot Lanka/gi, 'VibeLK');
 
     const postOptions = {
@@ -269,7 +300,6 @@ bot.command('admin', async (ctx) => {
   await ctx.replyWithHTML(renderAdminText(cfg), getAdminKeyboard(cfg));
 });
 
-// Reset Command with Safe Confirmation Prompt
 bot.command('resetdb', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   await setupAdminCommands();
@@ -312,7 +342,6 @@ bot.command('cancel', async (ctx) => {
   await ctx.reply('❌ Action cancelled.');
 });
 
-// --- Confirmation Actions for Reset DB ---
 bot.action('confirm_reset_db', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const db = await getDb();
@@ -336,7 +365,6 @@ bot.action('cancel_reset_db', async (ctx) => {
   await ctx.answerCbQuery('Cancelled');
 });
 
-// --- UI Actions ---
 bot.action('noop', (ctx) => ctx.answerCbQuery());
 
 bot.action('admin_refresh', async (ctx) => {
@@ -386,7 +414,6 @@ bot.action('admin_post_now', async (ctx) => {
   }
 });
 
-// Times Menu
 bot.action('admin_ui_times', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const db = await getDb();
@@ -402,7 +429,6 @@ bot.action('admin_ui_times', async (ctx) => {
   await ctx.answerCbQuery();
 });
 
-// Prompt Admin to send Time
 bot.action('admin_ui_add_time', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const db = await getDb();
@@ -419,7 +445,6 @@ bot.action('admin_ui_add_time', async (ctx) => {
   await ctx.answerCbQuery();
 });
 
-// Remove Time
 bot.action(/del_time_(.+)/, async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const timeToRemove = ctx.match[1];
@@ -441,7 +466,6 @@ bot.action(/del_time_(.+)/, async (ctx) => {
   await ctx.answerCbQuery(`Removed ${timeToRemove}`);
 });
 
-// Add Time via Chat Text
 bot.on('text', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   const text = ctx.message.text.trim();
@@ -473,7 +497,6 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// UI: Batch Size
 bot.action('admin_ui_batch', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const kb = Markup.inlineKeyboard([
@@ -505,7 +528,6 @@ bot.action(/set_batch_(\d+)/, async (ctx) => {
   }).catch(() => {});
 });
 
-// UI: Auto-Approve Channels
 bot.action('admin_ui_channels', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery();
   const db = await getDb();
@@ -549,7 +571,6 @@ bot.action(/remove_ch_(.+)/, async (ctx) => {
   (cfg.approved_channels || []).forEach((ch) => {
     buttons.push([Markup.button.callback(`🗑 Remove ${ch.title}`, `remove_ch_${ch.id}`)]);
   });
-  buttons.push([Markup.button.callback('➕ Add Channel', 'admin_ui_add_ch')]);
   buttons.push([Markup.button.callback('🔙 Back', 'admin_refresh')]);
 
   await ctx.editMessageText(text, {
@@ -563,7 +584,6 @@ module.exports = async (req, res) => {
   try {
     const db = await getDb();
 
-    // Cron Ping Handler
     if (req.method === 'GET') {
       const now = new Date();
       const slDate = new Date(now.getTime() + (5.5 * 60 * 60 * 1000));
@@ -593,7 +613,6 @@ module.exports = async (req, res) => {
       return res.status(200).json({ ok: true, keepalive: true });
     }
 
-    // Telegram Updates
     if (req.method === 'POST' && req.body) {
       await bot.handleUpdate(req.body);
       return res.status(200).json({ ok: true });
