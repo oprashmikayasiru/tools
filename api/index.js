@@ -89,7 +89,6 @@ async function getConfig(db) {
     };
     await db.collection('settings').insertOne(cfg);
   } else {
-    // Seamless upgrade for existing database configs
     const updates = {};
     if (!cfg.main_channel) updates.main_channel = { id: DEFAULT_SOURCE_ID, title: 'Hot Lanka V2' };
     if (!cfg.target_channel) updates.target_channel = { id: DEFAULT_TARGET_ID, title: 'VibeLK 🔥' };
@@ -195,8 +194,10 @@ function rebuildHtmlWithEntities(text, entities) {
   return result;
 }
 
-// --- Bridge Processor: Source -> Extract -> Delete Temp -> Target Rebrand ---
-async function copyWithExtractedButtons(sourceId, targetId, msgId) {
+// --- Bridge Processor: Source -> Extract -> Delete Temp -> Target/Archive ---
+async function copyWithExtractedButtons(sourceId, targetId, msgId, options = {}) {
+  const { rebrand = true, silent = false } = options;
+
   const forwarded = await bot.telegram.forwardMessage(
     ADMIN_ID,
     sourceId,
@@ -207,8 +208,8 @@ async function copyWithExtractedButtons(sourceId, targetId, msgId) {
   let targetMsg = null;
 
   try {
-    // Skip multi-photo/video albums without single post structure
-    if (forwarded.media_group_id) {
+    // Skip multi-photo/video albums only when posting to Rebrand Target
+    if (rebrand && forwarded.media_group_id) {
       return { skippedAlbum: true };
     }
 
@@ -217,12 +218,17 @@ async function copyWithExtractedButtons(sourceId, targetId, msgId) {
     const entities = forwarded.caption_entities || forwarded.entities || [];
 
     let formattedText = rebuildHtmlWithEntities(rawText, entities);
-    formattedText = formattedText.replace(/Hot Lanka/gi, 'VibeLK');
+
+    // Re-brand only for Target channel; keep 100% original for Archive & Restore
+    if (rebrand) {
+      formattedText = formattedText.replace(/Hot Lanka/gi, 'VibeLK');
+    }
 
     const postOptions = {
       caption: formattedText,
       parse_mode: 'HTML',
-      reply_markup: originalMarkup
+      reply_markup: originalMarkup,
+      disable_notification: silent
     };
 
     if (forwarded.photo && forwarded.photo.length > 0) {
@@ -237,13 +243,15 @@ async function copyWithExtractedButtons(sourceId, targetId, msgId) {
     } else if (forwarded.text) {
       targetMsg = await bot.telegram.sendMessage(targetId, formattedText, {
         parse_mode: 'HTML',
-        reply_markup: originalMarkup
+        reply_markup: originalMarkup,
+        disable_notification: silent
       });
     } else {
       targetMsg = await bot.telegram.copyMessage(targetId, sourceId, msgId, {
         caption: formattedText,
         parse_mode: 'HTML',
-        reply_markup: originalMarkup
+        reply_markup: originalMarkup,
+        disable_notification: silent
       });
     }
   } finally {
@@ -272,7 +280,6 @@ async function runPostingBatch(db, manualTrigger = false) {
     const startTime = Date.now();
 
     while (postedCount < targetCount && currentMsgId < maxScanLimit) {
-      // Vercel 10s safety guard (stop cleanly at 7.5s)
       if (Date.now() - startTime > 7500) break;
 
       const isAlreadyProcessed = await db.collection('processed_posts').findOne({ _id: currentMsgId });
@@ -282,7 +289,10 @@ async function runPostingBatch(db, manualTrigger = false) {
       }
 
       try {
-        const res = await copyWithExtractedButtons(sourceId, targetId, currentMsgId);
+        const res = await copyWithExtractedButtons(sourceId, targetId, currentMsgId, {
+          rebrand: true,
+          silent: false
+        });
 
         await db.collection('processed_posts').insertOne({
           _id: currentMsgId,
@@ -314,7 +324,7 @@ async function runPostingBatch(db, manualTrigger = false) {
   }
 }
 
-// --- Priority 2: Background Silent Archive Sync (Main -> Archive DB) ---
+// --- Priority 2: Background Silent Archive Sync (Main -> Archive DB with Exact Buttons) ---
 async function runArchiveSyncBatch(db, startTime) {
   const cfg = await getConfig(db);
   if (!cfg.archive_sync_enabled) return;
@@ -328,14 +338,13 @@ async function runArchiveSyncBatch(db, startTime) {
     let syncedInBatch = 0;
     let consecutiveErrors = 0;
 
-    // Max 6 posts per 5-min cron cycle to respect Telegram rate limits & Vercel timeout
-    while (syncedInBatch < 6 && Date.now() - startTime < 6800) {
+    while (syncedInBatch < 4 && Date.now() - startTime < 6800) {
       try {
-        const copied = await bot.telegram.copyMessage(
-          ARCHIVE_CHANNEL_ID,
+        const copied = await copyWithExtractedButtons(
           sourceId,
+          ARCHIVE_CHANNEL_ID,
           currentSrcId,
-          { disable_notification: true }
+          { rebrand: false, silent: true }
         );
 
         await db.collection('archive_map').insertOne({
@@ -356,16 +365,15 @@ async function runArchiveSyncBatch(db, startTime) {
           }
         );
 
-        await sleep(900);
+        await sleep(800);
       } catch (err) {
         const errMsg = String(err.message || '');
         if (errMsg.includes('429') || errMsg.includes('Too Many Requests')) {
-          break; // Pause immediately on rate limit
+          break;
         }
         consecutiveErrors++;
         currentSrcId++;
         if (consecutiveErrors >= 25) {
-          // Reached end of channel; save pointer back to last valid ID
           await db.collection('settings').updateOne(
             { _id: 'main_config' },
             { $set: { archive_last_source_id: currentSrcId - consecutiveErrors } }
@@ -379,7 +387,7 @@ async function runArchiveSyncBatch(db, startTime) {
   }
 }
 
-// --- Priority 2B: Disaster Recovery Restore Worker (Archive -> New Main) ---
+// --- Priority 2B: Disaster Recovery Restore Worker (Archive -> New Main with Exact Buttons) ---
 async function runArchiveRestoreBatch(db, startTime) {
   const cfg = await getConfig(db);
   const rState = cfg.restore_state;
@@ -393,13 +401,13 @@ async function runArchiveRestoreBatch(db, startTime) {
     let restoredInBatch = 0;
     let consecutiveErrors = 0;
 
-    while (restoredInBatch < 6 && Date.now() - startTime < 6800) {
+    while (restoredInBatch < 4 && Date.now() - startTime < 6800) {
       try {
-        await bot.telegram.copyMessage(
-          rState.target_id,
+        await copyWithExtractedButtons(
           ARCHIVE_CHANNEL_ID,
+          rState.target_id,
           archiveId,
-          { disable_notification: true }
+          { rebrand: false, silent: true }
         );
 
         restoredInBatch++;
@@ -411,7 +419,7 @@ async function runArchiveRestoreBatch(db, startTime) {
           { $set: { 'restore_state.current_archive_id': archiveId } }
         );
 
-        await sleep(900);
+        await sleep(800);
       } catch (err) {
         const errMsg = String(err.message || '');
         if (errMsg.includes('429') || errMsg.includes('Too Many Requests')) {
@@ -420,7 +428,6 @@ async function runArchiveRestoreBatch(db, startTime) {
         consecutiveErrors++;
         archiveId++;
 
-        // When 25 empty IDs reached, archive restore is complete
         if (consecutiveErrors >= 25) {
           const newMain = { id: rState.target_id, title: rState.target_title };
           await db.collection('settings').updateOne(
@@ -642,7 +649,6 @@ bot.on('message', async (ctx, next) => {
     const chTitle = shared.title || `Channel (${chId})`;
     const db = await getDb();
 
-    // Verify Bot Admin & Post Permission first
     const check = await verifyBotChannelAdmin(chId);
     if (!check.ok) {
       await ctx.reply(
@@ -655,7 +661,6 @@ bot.on('message', async (ctx, next) => {
       return;
     }
 
-    // Request ID 1: Select Main Channel
     if (reqId === 1) {
       await db.collection('settings').updateOne(
         { _id: 'main_config' },
@@ -670,7 +675,6 @@ bot.on('message', async (ctx, next) => {
       return;
     }
 
-    // Request ID 2: Select Target Channel
     if (reqId === 2) {
       await db.collection('settings').updateOne(
         { _id: 'main_config' },
@@ -685,7 +689,6 @@ bot.on('message', async (ctx, next) => {
       return;
     }
 
-    // Request ID 3: Restore Archive -> Confirmation Prompt
     if (reqId === 3) {
       const cfg = await getConfig(db);
       await db.collection('settings').updateOne(
@@ -711,7 +714,6 @@ bot.on('message', async (ctx, next) => {
       return;
     }
 
-    // Request ID 4: Add Auto-Approve Channel
     if (reqId === 4) {
       await db.collection('settings').updateOne(
         { _id: 'main_config' },
@@ -1125,7 +1127,7 @@ module.exports = async (req, res) => {
         }
       }
 
-      // PRIORITY 2: Skip Archive/Restore during scheduled publish window to avoid 10s timeout
+      // PRIORITY 2: Skip Archive/Restore during scheduled publish window
       if (!ranScheduledPost) {
         if (cfg.restore_state && cfg.restore_state.is_restoring) {
           await runArchiveRestoreBatch(db, startTime);
