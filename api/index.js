@@ -331,7 +331,7 @@ async function runPostingBatch(db, manualTrigger = false) {
   }
 }
 
-// --- Priority 2: Fast Background Silent Archive Sync (Main -> Archive DB with Exact Buttons) ---
+// --- Priority 2: Ultra-Fast Background Silent Archive Sync ---
 async function runArchiveSyncBatch(db, startTime) {
   const cfg = await getConfig(db);
   if (!cfg.archive_sync_enabled) return;
@@ -339,40 +339,27 @@ async function runArchiveSyncBatch(db, startTime) {
   const locked = await acquireLock(db);
   if (!locked) return;
 
+  let currentSrcId = cfg.archive_last_source_id || 7;
+  let syncedInBatch = 0;
+
   try {
     const sourceId = cfg.main_channel.id;
-    let currentSrcId = cfg.archive_last_source_id || 7;
-    let syncedInBatch = 0;
     let consecutiveErrors = 0;
 
-    while (syncedInBatch < 10 && Date.now() - startTime < 7300) {
+    while (syncedInBatch < 10 && Date.now() - startTime < 8500) {
       try {
-        const copied = await copyWithExtractedButtons(
+        await copyWithExtractedButtons(
           sourceId,
           ARCHIVE_CHANNEL_ID,
           currentSrcId,
           { rebrand: false, silent: true }
         );
 
-        await db.collection('archive_map').insertOne({
-          archive_msg_id: copied.message_id,
-          source_msg_id: currentSrcId,
-          synced_at: new Date()
-        }).catch(() => {});
-
         syncedInBatch++;
         consecutiveErrors = 0;
         currentSrcId++;
 
-        await db.collection('settings').updateOne(
-          { _id: 'main_config' },
-          {
-            $set: { archive_last_source_id: currentSrcId },
-            $inc: { archive_count: 1 }
-          }
-        );
-
-        await sleep(500);
+        await sleep(200);
       } catch (err) {
         const errMsg = String(err.message || '');
         if (errMsg.includes('429') || errMsg.includes('Too Many Requests')) {
@@ -381,15 +368,21 @@ async function runArchiveSyncBatch(db, startTime) {
         consecutiveErrors++;
         currentSrcId++;
         if (consecutiveErrors >= 25) {
-          await db.collection('settings').updateOne(
-            { _id: 'main_config' },
-            { $set: { archive_last_source_id: currentSrcId - consecutiveErrors } }
-          );
+          currentSrcId -= consecutiveErrors;
           break;
         }
       }
     }
   } finally {
+    if (syncedInBatch > 0 || currentSrcId !== (cfg.archive_last_source_id || 7)) {
+      await db.collection('settings').updateOne(
+        { _id: 'main_config' },
+        {
+          $set: { archive_last_source_id: currentSrcId },
+          $inc: { archive_count: syncedInBatch }
+        }
+      ).catch(() => {});
+    }
     await releaseLock(db);
   }
 }
@@ -403,13 +396,15 @@ async function runArchiveRestoreBatch(db, startTime) {
   const locked = await acquireLock(db);
   if (!locked) return;
 
+  let archiveId = rState.current_archive_id || 1;
+  let lastRestoredDestId = rState.last_restored_dest_id || 1;
+  let restoredInBatch = 0;
+  let isCompleted = false;
+
   try {
-    let archiveId = rState.current_archive_id || 1;
-    let lastRestoredDestId = rState.last_restored_dest_id || 1;
-    let restoredInBatch = 0;
     let consecutiveErrors = 0;
 
-    while (restoredInBatch < 10 && Date.now() - startTime < 7300) {
+    while (restoredInBatch < 10 && Date.now() - startTime < 8500) {
       try {
         const sentMsg = await copyWithExtractedButtons(
           ARCHIVE_CHANNEL_ID,
@@ -426,17 +421,7 @@ async function runArchiveRestoreBatch(db, startTime) {
         consecutiveErrors = 0;
         archiveId++;
 
-        await db.collection('settings').updateOne(
-          { _id: 'main_config' },
-          {
-            $set: {
-              'restore_state.current_archive_id': archiveId,
-              'restore_state.last_restored_dest_id': lastRestoredDestId
-            }
-          }
-        );
-
-        await sleep(500);
+        await sleep(200);
       } catch (err) {
         const errMsg = String(err.message || '');
         if (errMsg.includes('429') || errMsg.includes('Too Many Requests')) {
@@ -446,41 +431,54 @@ async function runArchiveRestoreBatch(db, startTime) {
         archiveId++;
 
         if (consecutiveErrors >= 25) {
-          const newMain = { id: rState.target_id, title: rState.target_title };
-          const nextStartId = lastRestoredDestId + 1;
-
-          await db.collection('processed_posts').deleteMany({});
-
-          await db.collection('settings').updateOne(
-            { _id: 'main_config' },
-            {
-              $set: {
-                main_channel: newMain,
-                last_message_id: nextStartId,
-                archive_last_source_id: nextStartId,
-                restore_state: {
-                  is_restoring: false,
-                  target_id: null,
-                  target_title: null,
-                  current_archive_id: 1,
-                  last_restored_dest_id: 1
-                }
-              }
-            }
-          );
-
-          await bot.telegram.sendMessage(
-            ADMIN_ID,
-            `✅ <b>Restore Complete!</b>\n` +
-            `<b>${rState.target_title}</b> is now your Main Channel.\n` +
-            `📌 Next Post ID set to: <b>#${nextStartId}</b> (No duplicate posts will be sent to Target).`,
-            { parse_mode: 'HTML' }
-          ).catch(() => {});
+          isCompleted = true;
           break;
         }
       }
     }
   } finally {
+    if (isCompleted) {
+      const newMain = { id: rState.target_id, title: rState.target_title };
+      const nextStartId = lastRestoredDestId + 1;
+
+      await db.collection('processed_posts').deleteMany({}).catch(() => {});
+
+      await db.collection('settings').updateOne(
+        { _id: 'main_config' },
+        {
+          $set: {
+            main_channel: newMain,
+            last_message_id: nextStartId,
+            archive_last_source_id: nextStartId,
+            restore_state: {
+              is_restoring: false,
+              target_id: null,
+              target_title: null,
+              current_archive_id: 1,
+              last_restored_dest_id: 1
+            }
+          }
+        }
+      ).catch(() => {});
+
+      await bot.telegram.sendMessage(
+        ADMIN_ID,
+        `✅ <b>Restore Complete!</b>\n` +
+        `<b>${rState.target_title}</b> is now your Main Channel.\n` +
+        `📌 Next Post ID set to: <b>#${nextStartId}</b> (No duplicate posts will be sent to Target).`,
+        { parse_mode: 'HTML' }
+      ).catch(() => {});
+    } else if (restoredInBatch > 0 || archiveId !== (rState.current_archive_id || 1)) {
+      await db.collection('settings').updateOne(
+        { _id: 'main_config' },
+        {
+          $set: {
+            'restore_state.current_archive_id': archiveId,
+            'restore_state.last_restored_dest_id': lastRestoredDestId
+          }
+        }
+      ).catch(() => {});
+    }
     await releaseLock(db);
   }
 }
