@@ -77,7 +77,8 @@ async function getConfig(db) {
         is_restoring: false,
         target_id: null,
         target_title: null,
-        current_archive_id: 1
+        current_archive_id: 1,
+        last_restored_dest_id: 1
       },
       pending_restore: null,
       is_locked: false,
@@ -96,7 +97,13 @@ async function getConfig(db) {
     if (cfg.archive_last_source_id === undefined) updates.archive_last_source_id = cfg.last_message_id || 7;
     if (cfg.archive_count === undefined) updates.archive_count = 0;
     if (!cfg.restore_state) {
-      updates.restore_state = { is_restoring: false, target_id: null, target_title: null, current_archive_id: 1 };
+      updates.restore_state = {
+        is_restoring: false,
+        target_id: null,
+        target_title: null,
+        current_archive_id: 1,
+        last_restored_dest_id: 1
+      };
     }
     if (Object.keys(updates).length > 0) {
       await db.collection('settings').updateOne({ _id: 'main_config' }, { $set: updates });
@@ -387,7 +394,7 @@ async function runArchiveSyncBatch(db, startTime) {
   }
 }
 
-// --- Priority 2B: Disaster Recovery Restore Worker (Archive -> New Main with Exact Buttons) ---
+// --- Priority 2B: Disaster Recovery Restore Worker (Archive -> New Main with Auto-ID Sync) ---
 async function runArchiveRestoreBatch(db, startTime) {
   const cfg = await getConfig(db);
   const rState = cfg.restore_state;
@@ -398,17 +405,22 @@ async function runArchiveRestoreBatch(db, startTime) {
 
   try {
     let archiveId = rState.current_archive_id || 1;
+    let lastRestoredDestId = rState.last_restored_dest_id || 1;
     let restoredInBatch = 0;
     let consecutiveErrors = 0;
 
     while (restoredInBatch < 4 && Date.now() - startTime < 6800) {
       try {
-        await copyWithExtractedButtons(
+        const sentMsg = await copyWithExtractedButtons(
           ARCHIVE_CHANNEL_ID,
           rState.target_id,
           archiveId,
           { rebrand: false, silent: true }
         );
+
+        if (sentMsg && sentMsg.message_id) {
+          lastRestoredDestId = sentMsg.message_id;
+        }
 
         restoredInBatch++;
         consecutiveErrors = 0;
@@ -416,7 +428,12 @@ async function runArchiveRestoreBatch(db, startTime) {
 
         await db.collection('settings').updateOne(
           { _id: 'main_config' },
-          { $set: { 'restore_state.current_archive_id': archiveId } }
+          {
+            $set: {
+              'restore_state.current_archive_id': archiveId,
+              'restore_state.last_restored_dest_id': lastRestoredDestId
+            }
+          }
         );
 
         await sleep(800);
@@ -430,16 +447,23 @@ async function runArchiveRestoreBatch(db, startTime) {
 
         if (consecutiveErrors >= 25) {
           const newMain = { id: rState.target_id, title: rState.target_title };
+          const nextStartId = lastRestoredDestId + 1;
+
+          await db.collection('processed_posts').deleteMany({});
+
           await db.collection('settings').updateOne(
             { _id: 'main_config' },
             {
               $set: {
                 main_channel: newMain,
+                last_message_id: nextStartId,
+                archive_last_source_id: nextStartId,
                 restore_state: {
                   is_restoring: false,
                   target_id: null,
                   target_title: null,
-                  current_archive_id: 1
+                  current_archive_id: 1,
+                  last_restored_dest_id: 1
                 }
               }
             }
@@ -447,7 +471,9 @@ async function runArchiveRestoreBatch(db, startTime) {
 
           await bot.telegram.sendMessage(
             ADMIN_ID,
-            `✅ <b>Restore Complete!</b>\n<b>${rState.target_title}</b> is now set as your Main Channel.`,
+            `✅ <b>Restore Complete!</b>\n` +
+            `<b>${rState.target_title}</b> is now your Main Channel.\n` +
+            `📌 Next Post ID set to: <b>#${nextStartId}</b> (No duplicate posts will be sent to Target).`,
             { parse_mode: 'HTML' }
           ).catch(() => {});
           break;
@@ -820,7 +846,8 @@ bot.action('confirm_restore_archive', async (ctx) => {
           is_restoring: true,
           target_id: dest.id,
           target_title: dest.title,
-          current_archive_id: 1
+          current_archive_id: 1,
+          last_restored_dest_id: 1
         },
         pending_restore: null
       }
