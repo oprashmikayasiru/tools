@@ -331,7 +331,7 @@ async function runPostingBatch(db, manualTrigger = false) {
   }
 }
 
-// --- Priority 2: Background Silent Archive Sync (Main -> Archive DB with Exact Buttons) ---
+// --- Priority 2: Fast Background Silent Archive Sync (Main -> Archive DB with Exact Buttons) ---
 async function runArchiveSyncBatch(db, startTime) {
   const cfg = await getConfig(db);
   if (!cfg.archive_sync_enabled) return;
@@ -345,7 +345,7 @@ async function runArchiveSyncBatch(db, startTime) {
     let syncedInBatch = 0;
     let consecutiveErrors = 0;
 
-    while (syncedInBatch < 4 && Date.now() - startTime < 6800) {
+    while (syncedInBatch < 10 && Date.now() - startTime < 7300) {
       try {
         const copied = await copyWithExtractedButtons(
           sourceId,
@@ -372,7 +372,7 @@ async function runArchiveSyncBatch(db, startTime) {
           }
         );
 
-        await sleep(800);
+        await sleep(500);
       } catch (err) {
         const errMsg = String(err.message || '');
         if (errMsg.includes('429') || errMsg.includes('Too Many Requests')) {
@@ -394,7 +394,7 @@ async function runArchiveSyncBatch(db, startTime) {
   }
 }
 
-// --- Priority 2B: Disaster Recovery Restore Worker (Archive -> New Main with Auto-ID Sync) ---
+// --- Priority 2B: Fast Disaster Recovery Restore Worker (Archive -> New Main with Auto-ID Sync) ---
 async function runArchiveRestoreBatch(db, startTime) {
   const cfg = await getConfig(db);
   const rState = cfg.restore_state;
@@ -409,7 +409,7 @@ async function runArchiveRestoreBatch(db, startTime) {
     let restoredInBatch = 0;
     let consecutiveErrors = 0;
 
-    while (restoredInBatch < 4 && Date.now() - startTime < 6800) {
+    while (restoredInBatch < 10 && Date.now() - startTime < 7300) {
       try {
         const sentMsg = await copyWithExtractedButtons(
           ARCHIVE_CHANNEL_ID,
@@ -436,7 +436,7 @@ async function runArchiveRestoreBatch(db, startTime) {
           }
         );
 
-        await sleep(800);
+        await sleep(500);
       } catch (err) {
         const errMsg = String(err.message || '');
         if (errMsg.includes('429') || errMsg.includes('Too Many Requests')) {
@@ -1121,7 +1121,7 @@ bot.action(/remove_ch_(.+)/, async (ctx) => {
   }).catch(() => {});
 });
 
-// --- Serverless Gateway (Priority Scheduled Posting + Background Archive) ---
+// --- Serverless Gateway (Priority Scheduled Posting + Fast Background Archive) ---
 module.exports = async (req, res) => {
   const startTime = Date.now();
 
