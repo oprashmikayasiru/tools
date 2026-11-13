@@ -268,32 +268,30 @@ async function copyWithExtractedButtons(sourceId, targetId, msgId, options = {})
   return targetMsg;
 }
 
-// --- Priority 1: Posting Batch Loop (Main -> Target Rebrand) ---
+// --- Priority 1: Fast Posting Batch Loop (Main -> Target Rebrand) ---
 async function runPostingBatch(db, manualTrigger = false) {
   const locked = await acquireLock(db);
   if (!locked) return { posted: 0, busy: true };
 
-  try {
-    const cfg = await getConfig(db);
-    if (!cfg.is_active && !manualTrigger) return { posted: 0 };
+  const cfg = await getConfig(db);
+  if (!cfg.is_active && !manualTrigger) {
+    await releaseLock(db);
+    return { posted: 0 };
+  }
 
+  let currentMsgId = cfg.last_message_id || 7;
+  let postedCount = 0;
+
+  try {
     const sourceId = cfg.main_channel.id;
     const targetId = cfg.target_channel.id;
-    let currentMsgId = cfg.last_message_id || 7;
-    let postedCount = 0;
     const targetCount = cfg.batch_size || 5;
     let consecutiveErrors = 0;
     const maxScanLimit = currentMsgId + 60;
     const startTime = Date.now();
 
     while (postedCount < targetCount && currentMsgId < maxScanLimit) {
-      if (Date.now() - startTime > 7500) break;
-
-      const isAlreadyProcessed = await db.collection('processed_posts').findOne({ _id: currentMsgId });
-      if (isAlreadyProcessed) {
-        currentMsgId++;
-        continue;
-      }
+      if (Date.now() - startTime > 8500) break;
 
       try {
         const res = await copyWithExtractedButtons(sourceId, targetId, currentMsgId, {
@@ -312,21 +310,25 @@ async function runPostingBatch(db, manualTrigger = false) {
         }
         consecutiveErrors = 0;
 
-        await db.collection('settings').updateOne(
-          { _id: 'main_config' },
-          { $set: { last_message_id: currentMsgId + 1 } }
-        );
-
-        await sleep(500);
+        await sleep(200);
       } catch (err) {
         consecutiveErrors++;
-        if (consecutiveErrors >= 25) break;
+        if (consecutiveErrors >= 25) {
+          currentMsgId -= consecutiveErrors - 1;
+          break;
+        }
       }
       currentMsgId++;
     }
 
     return { posted: postedCount, nextId: currentMsgId };
   } finally {
+    if (postedCount > 0 || currentMsgId !== (cfg.last_message_id || 7)) {
+      await db.collection('settings').updateOne(
+        { _id: 'main_config' },
+        { $set: { last_message_id: currentMsgId } }
+      ).catch(() => {});
+    }
     await releaseLock(db);
   }
 }
