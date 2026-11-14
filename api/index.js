@@ -268,7 +268,7 @@ async function copyWithExtractedButtons(sourceId, targetId, msgId, options = {})
   return targetMsg;
 }
 
-// --- Priority 1: Fast Posting Batch Loop (Main -> Target Rebrand) ---
+// --- Priority 1: Fast Posting Batch Loop (Zero Pointer Drift) ---
 async function runPostingBatch(db, manualTrigger = false) {
   const locked = await acquireLock(db);
   if (!locked) return { posted: 0, busy: true };
@@ -279,7 +279,9 @@ async function runPostingBatch(db, manualTrigger = false) {
     return { posted: 0 };
   }
 
-  let currentMsgId = cfg.last_message_id || 7;
+  const initialMsgId = cfg.last_message_id || 7;
+  let currentMsgId = initialMsgId;
+  let nextValidMsgId = initialMsgId; // Advances ONLY when a message actually succeeds/skips
   let postedCount = 0;
 
   try {
@@ -287,7 +289,7 @@ async function runPostingBatch(db, manualTrigger = false) {
     const targetId = cfg.target_channel.id;
     const targetCount = cfg.batch_size || 5;
     let consecutiveErrors = 0;
-    const maxScanLimit = currentMsgId + 60;
+    const maxScanLimit = initialMsgId + 60;
     const startTime = Date.now();
 
     while (postedCount < targetCount && currentMsgId < maxScanLimit) {
@@ -309,31 +311,30 @@ async function runPostingBatch(db, manualTrigger = false) {
           postedCount++;
         }
         consecutiveErrors = 0;
+        currentMsgId++;
+        nextValidMsgId = currentMsgId;
 
         await sleep(200);
       } catch (err) {
         consecutiveErrors++;
-        if (consecutiveErrors >= 25) {
-          currentMsgId -= consecutiveErrors - 1;
-          break;
-        }
+        currentMsgId++;
+        if (consecutiveErrors >= 25) break;
       }
-      currentMsgId++;
     }
 
-    return { posted: postedCount, nextId: currentMsgId };
+    return { posted: postedCount, nextId: nextValidMsgId };
   } finally {
-    if (postedCount > 0 || currentMsgId !== (cfg.last_message_id || 7)) {
+    if (nextValidMsgId !== initialMsgId) {
       await db.collection('settings').updateOne(
         { _id: 'main_config' },
-        { $set: { last_message_id: currentMsgId } }
+        { $set: { last_message_id: nextValidMsgId } }
       ).catch(() => {});
     }
     await releaseLock(db);
   }
 }
 
-// --- Priority 2: Ultra-Fast Background Silent Archive Sync ---
+// --- Priority 2: Ultra-Fast Background Silent Archive Sync (Zero Pointer Drift) ---
 async function runArchiveSyncBatch(db, startTime) {
   const cfg = await getConfig(db);
   if (!cfg.archive_sync_enabled) return;
@@ -341,7 +342,9 @@ async function runArchiveSyncBatch(db, startTime) {
   const locked = await acquireLock(db);
   if (!locked) return;
 
-  let currentSrcId = cfg.archive_last_source_id || 7;
+  const initialSrcId = cfg.archive_last_source_id || 7;
+  let currentSrcId = initialSrcId;
+  let nextValidSrcId = initialSrcId; // Advances ONLY when a post actually backs up
   let syncedInBatch = 0;
 
   try {
@@ -360,6 +363,7 @@ async function runArchiveSyncBatch(db, startTime) {
         syncedInBatch++;
         consecutiveErrors = 0;
         currentSrcId++;
+        nextValidSrcId = currentSrcId;
 
         await sleep(200);
       } catch (err) {
@@ -369,18 +373,15 @@ async function runArchiveSyncBatch(db, startTime) {
         }
         consecutiveErrors++;
         currentSrcId++;
-        if (consecutiveErrors >= 25) {
-          currentSrcId -= consecutiveErrors;
-          break;
-        }
+        if (consecutiveErrors >= 25) break;
       }
     }
   } finally {
-    if (syncedInBatch > 0 || currentSrcId !== (cfg.archive_last_source_id || 7)) {
+    if (syncedInBatch > 0 && nextValidSrcId !== initialSrcId) {
       await db.collection('settings').updateOne(
         { _id: 'main_config' },
         {
-          $set: { archive_last_source_id: currentSrcId },
+          $set: { archive_last_source_id: nextValidSrcId },
           $inc: { archive_count: syncedInBatch }
         }
       ).catch(() => {});
@@ -398,7 +399,9 @@ async function runArchiveRestoreBatch(db, startTime) {
   const locked = await acquireLock(db);
   if (!locked) return;
 
-  let archiveId = rState.current_archive_id || 1;
+  const initialArchiveId = rState.current_archive_id || 1;
+  let archiveId = initialArchiveId;
+  let nextValidArchiveId = initialArchiveId;
   let lastRestoredDestId = rState.last_restored_dest_id || 1;
   let restoredInBatch = 0;
   let isCompleted = false;
@@ -422,6 +425,7 @@ async function runArchiveRestoreBatch(db, startTime) {
         restoredInBatch++;
         consecutiveErrors = 0;
         archiveId++;
+        nextValidArchiveId = archiveId;
 
         await sleep(200);
       } catch (err) {
@@ -470,12 +474,12 @@ async function runArchiveRestoreBatch(db, startTime) {
         `📌 Next Post ID set to: <b>#${nextStartId}</b> (No duplicate posts will be sent to Target).`,
         { parse_mode: 'HTML' }
       ).catch(() => {});
-    } else if (restoredInBatch > 0 || archiveId !== (rState.current_archive_id || 1)) {
+    } else if (restoredInBatch > 0 && nextValidArchiveId !== initialArchiveId) {
       await db.collection('settings').updateOne(
         { _id: 'main_config' },
         {
           $set: {
-            'restore_state.current_archive_id': archiveId,
+            'restore_state.current_archive_id': nextValidArchiveId,
             'restore_state.last_restored_dest_id': lastRestoredDestId
           }
         }
